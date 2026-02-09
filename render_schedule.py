@@ -21,6 +21,14 @@ def _render_group(group: dict) -> str:
     day_keys = sorted(days.keys(), key=lambda x: int(x))
     day_names = [days[k]["weekday_name"] for k in day_keys]
 
+    subject_counts_by_day: Dict[str, Dict[int, int]] = {}
+    for k in day_keys:
+        counts: Dict[int, int] = {}
+        for slot in days[k]["slots"]:
+            for subject_id in slot["subject_ids"]:
+                counts[subject_id] = counts.get(subject_id, 0) + 1
+        subject_counts_by_day[k] = counts
+
     max_slots = 0
     for k in day_keys:
         max_slots = max(max_slots, len(days[k]["slots"]))
@@ -33,13 +41,18 @@ def _render_group(group: dict) -> str:
             if i < len(slots):
                 slot = slots[i]
                 if slot["curriculum_ids"]:
+                    repeat = False
+                    for subject_id in slot["subject_ids"]:
+                        if subject_counts_by_day[k].get(subject_id, 0) >= 2:
+                            repeat = True
+                            break
                     cell = (
                         f"<div class=\"time\">{_fmt_time(slot['start_time'])}-{_fmt_time(slot['end_time'])}</div>"
                         f"<div class=\"meta\"><span>S:</span> {_fmt_list(slot['subject_ids'])}</div>"
                         f"<div class=\"meta\"><span>T:</span> {_fmt_list(slot['teacher_ids'])}</div>"
                         f"<div class=\"meta\"><span>C:</span> {_fmt_list(slot['curriculum_ids'])}</div>"
                     )
-                    cell_class = "assigned"
+                    cell_class = "assigned repeat" if repeat else "assigned"
                 else:
                     prev_assigned = False
                     next_assigned = False
@@ -158,6 +171,9 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
     }}
     td.gap {{
       background: #f6c4c4;
+    }}
+    td.repeat {{
+      background: #ccebd7;
     }}
     section {{
       margin-bottom: 32px;

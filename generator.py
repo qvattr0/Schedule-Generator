@@ -128,6 +128,8 @@ def build_model(
     early_weight: int = 1,
     unassigned_weight: int = 1000,
     over_capacity_strategy: str = "unassigned",
+    subject_spread_strategy: str = "soft",
+    subject_spread_weight: int = 5,
 ):
     model = cp_model.CpModel()
 
@@ -168,6 +170,11 @@ def build_model(
         # Create variables
         slot_to_xs: Dict[int, List] = {slot.id: [] for slot in slots}
 
+        subject_to_bundles: Dict[int, List[int]] = collections.defaultdict(list)
+        for bundle in bundles:
+            for subject_id in bundle.subject_ids:
+                subject_to_bundles[subject_id].append(bundle.id)
+
         for bundle in bundles:
             for slot in slots:
                 var = model.new_bool_var(f"x_g{gid}_b{bundle.id}_s{slot.id}")
@@ -201,6 +208,15 @@ def build_model(
                 "Use 'unassigned' or 'trim'."
             )
 
+        spread_strategy = subject_spread_strategy.lower()
+        if spread_strategy not in {"off", "soft", "hard", "both"}:
+            raise ValueError(
+                f"Unknown subject_spread_strategy: {subject_spread_strategy}. "
+                "Use 'off', 'soft', 'hard', or 'both'."
+            )
+        spread_soft = spread_strategy in {"soft", "both"}
+        spread_hard = spread_strategy in {"hard", "both"}
+
         allow_unassigned = strategy == "unassigned" and required_lessons > capacity
         trimmed_counts: Dict[int, int] = {b.id: b.lesson_count for b in bundles}
         trimmed = 0
@@ -229,6 +245,58 @@ def build_model(
                     objective_terms.append(unassigned_weight * (target_count - scheduled))
             else:
                 model.add(scheduled == target_count)
+
+        # Subject distribution constraints/penalties within a day.
+        if spread_soft or spread_hard:
+            num_days = max(1, len(day_slots))
+            subject_target_counts = {
+                subject_id: sum(trimmed_counts[b_id] for b_id in bundle_ids)
+                for subject_id, bundle_ids in subject_to_bundles.items()
+            }
+
+            for subject_id, bundle_ids in subject_to_bundles.items():
+                if not bundle_ids:
+                    continue
+                required_for_subject = subject_target_counts.get(subject_id, 0)
+                if required_for_subject <= 0:
+                    continue
+                max_per_day_subject = (required_for_subject + num_days - 1) // num_days
+
+                for day_index, slot_ids in enumerate(day_slots):
+                    # Build subject occurrence vars/exprs for this day.
+                    occ_vars = []
+                    occ_exprs = []
+                    for sid in slot_ids:
+                        vars_for_slot = [x[(gid, b_id, sid)] for b_id in bundle_ids]
+                        if spread_soft:
+                            if len(vars_for_slot) == 1:
+                                occ_var = vars_for_slot[0]
+                            else:
+                                occ_var = model.new_bool_var(
+                                    f"subj_g{gid}_s{subject_id}_slot{sid}"
+                                )
+                                model.add(sum(vars_for_slot) == occ_var)
+                            occ_vars.append(occ_var)
+                        if spread_hard:
+                            occ_exprs.append(sum(vars_for_slot))
+
+                    if spread_hard and occ_exprs:
+                        model.add(sum(occ_exprs) <= max_per_day_subject)
+
+                    if spread_soft and len(occ_vars) >= 2:
+                        day_len = len(occ_vars)
+                        for i in range(day_len - 1):
+                            for j in range(i + 1, day_len):
+                                dist = j - i
+                                weight = (day_len - dist)
+                                both = model.new_bool_var(
+                                    f"subj_pair_g{gid}_s{subject_id}_d{day_index}_{i}_{j}"
+                                )
+                                model.add(both <= occ_vars[i])
+                                model.add(both <= occ_vars[j])
+                                model.add(both >= occ_vars[i] + occ_vars[j] - 1)
+                                if subject_spread_weight:
+                                    objective_terms.append(subject_spread_weight * weight * both)
 
         # Max lessons per day.
         for slot_ids in day_slots:
@@ -299,6 +367,8 @@ def solve(
     early_weight: int = 1,
     unassigned_weight: int = 1000,
     over_capacity_strategy: str = "unassigned",
+    subject_spread_strategy: str = "soft",
+    subject_spread_weight: int = 5,
     log: bool = False,
 ):
     model, x, occ, group_info = build_model(
@@ -306,11 +376,13 @@ def solve(
         early_weight=early_weight,
         unassigned_weight=unassigned_weight,
         over_capacity_strategy=over_capacity_strategy,
+        subject_spread_strategy=subject_spread_strategy,
+        subject_spread_weight=subject_spread_weight,
     )
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 16
     if log:
         solver.parameters.log_search_progress = True
 
@@ -394,6 +466,18 @@ def main():
         default="unassigned",
         help="How to handle groups with more required lessons than capacity",
     )
+    parser.add_argument(
+        "--subject-spread-strategy",
+        choices=["off", "soft", "hard", "both"],
+        default="soft",
+        help="Strategy for spreading same-subject lessons within a week",
+    )
+    parser.add_argument(
+        "--subject-spread-weight",
+        type=int,
+        default=5,
+        help="Penalty weight for same-subject proximity (soft/both strategies)",
+    )
     parser.add_argument("--output", default="schedule.json", help="Output JSON file")
     parser.add_argument(
         "--render",
@@ -421,6 +505,8 @@ def main():
         early_weight=args.early_weight,
         unassigned_weight=args.unassigned_weight,
         over_capacity_strategy=args.over_capacity_strategy,
+        subject_spread_strategy=args.subject_spread_strategy,
+        subject_spread_weight=args.subject_spread_weight,
         log=args.log,
     )
 
