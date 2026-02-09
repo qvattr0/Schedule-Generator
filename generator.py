@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from ortools.sat.python import cp_model
-from mock_data import data_v2 as data
+from mock_data import data as data
 from render_schedule import render_schedule
 
 
