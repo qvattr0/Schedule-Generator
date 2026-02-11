@@ -5,7 +5,7 @@ import sys
 import webbrowser
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from ortools.sat.python import cp_model
 from mock_data import data as data
 from render_schedule import render_schedule
@@ -121,6 +121,292 @@ def _trim_bundle_counts(bundles: List[Bundle], capacity: int) -> Tuple[Dict[int,
 
     trimmed = required - sum(counts.values())
     return counts, trimmed
+
+
+def analyze_infeasibility(
+    input_data: dict,
+    over_capacity_strategy: str = "unassigned",
+    subject_spread_strategy: str = "soft",
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
+        "global": {},
+        "groups": [],
+        "top_reasons": [],
+        "primary_cause": None,
+        "teacher_global_checks": [],
+    }
+
+    busy_slots = set()
+    for entry in (input_data.get("teachers_busy") or []):
+        teacher_id = entry.get("teacher_id", entry.get("staff_id"))
+        weekday_id = entry.get("weekday_id")
+        lesson_time_id = entry.get("lesson_time_id")
+        if teacher_id is None or weekday_id is None or lesson_time_id is None:
+            continue
+        busy_slots.add((int(teacher_id), int(weekday_id), int(lesson_time_id)))
+
+    teacher_max = {
+        int(t["teacher_id"]): int(t["lesson_week_count_sum"])
+        for t in (input_data.get("curriculum_teachers") or [])
+        if t.get("teacher_id") is not None and t.get("lesson_week_count_sum") is not None
+    }
+
+    strategy = str(over_capacity_strategy).lower()
+    spread = str(subject_spread_strategy).lower()
+
+    reasons_counter = collections.Counter()
+    best_deficit = None  # (deficit_value, group_id, teacher_id, reason, detail)
+
+    teacher_available_week = collections.Counter()
+    teacher_seen_slots = collections.defaultdict(set)
+
+    all_unique_times = set()
+    groups = input_data.get("groups_curriculum") or []
+    for g in groups:
+        for ws in (g.get("weekday_slots") or []):
+            wd = ws.get("weekday_id")
+            for lt in (ws.get("lesson_times_slots") or []):
+                all_unique_times.add((int(wd), int(lt["lesson_time_id"])))
+
+    for tid in teacher_max.keys():
+        for (wd, ltid) in all_unique_times:
+            if (tid, wd, ltid) not in busy_slots:
+                teacher_seen_slots[tid].add((wd, ltid))
+        teacher_available_week[tid] = len(teacher_seen_slots[tid])
+
+    teacher_required_total = collections.Counter()
+    teacher_group_times = collections.defaultdict(set)
+
+    for group in groups:
+        gid = int(group.get("group_id", 0))
+        curriculum_data = group.get("curriculum_data") or []
+        weekday_slots = group.get("weekday_slots") or []
+        max_per_day = int(group.get("max_lessons_per_day", 0) or 0)
+
+        g_times = set()
+        day_counts = []
+        for ws in weekday_slots:
+            wd = ws.get("weekday_id")
+            lts = ws.get("lesson_times_slots") or []
+            day_counts.append(len(lts))
+            for lt in lts:
+                g_times.add((int(wd), int(lt["lesson_time_id"])))
+
+        bundles, _ = _build_bundles(curriculum_data)
+        required_lessons = sum(int(b.lesson_count) for b in bundles)
+        capacity = sum(min(max_per_day, c) for c in day_counts) if max_per_day > 0 else 0
+
+        allow_unassigned = (strategy == "unassigned" and required_lessons > capacity)
+
+        g_reasons = []
+        g_detail: Dict[str, Any] = {
+            "group_id": gid,
+            "max_per_day": max_per_day,
+            "days": len(weekday_slots),
+            "slots_unique": len(g_times),
+            "required_lessons": required_lessons,
+            "capacity": capacity,
+            "over_capacity_strategy": strategy,
+            "allow_unassigned": allow_unassigned,
+            "subject_spread_strategy": spread,
+            "reasons": [],
+            "teacher_checks": [],
+        }
+
+        if len(g_times) == 0:
+            g_reasons.append("NO_SLOTS")
+            reasons_counter["NO_SLOTS"] += 1
+            if best_deficit is None:
+                best_deficit = (10**9, gid, None, "NO_SLOTS", {"slots_unique": 0})
+
+        if max_per_day <= 0:
+            g_reasons.append("MAX_PER_DAY_ZERO")
+            reasons_counter["MAX_PER_DAY_ZERO"] += 1
+            if best_deficit is None:
+                best_deficit = (10**8, gid, None, "MAX_PER_DAY_ZERO", {"max_per_day": max_per_day})
+
+        if capacity < required_lessons and not allow_unassigned and strategy != "trim":
+            g_reasons.append("CAPACITY_LT_REQUIRED")
+            reasons_counter["CAPACITY_LT_REQUIRED"] += 1
+            deficit = required_lessons - capacity
+            if best_deficit is None or deficit > best_deficit[0]:
+                best_deficit = (deficit, gid, None, "CAPACITY_LT_REQUIRED", {"required": required_lessons, "capacity": capacity})
+
+        curriculum_ids = {int(cd["curriculum_id"]) for cd in curriculum_data if cd.get("curriculum_id") is not None}
+        missing_match = 0
+        for cd in curriculum_data:
+            mid = cd.get("match_with_curriculum_id")
+            if mid is not None and int(mid) not in curriculum_ids:
+                missing_match += 1
+        if missing_match:
+            g_reasons.append("MATCH_WITH_MISSING")
+            reasons_counter["MATCH_WITH_MISSING"] += 1
+            g_detail["missing_match_count"] = int(missing_match)
+
+        teacher_required_in_group = collections.Counter()
+        for b in bundles:
+            for tid in b.teacher_ids:
+                teacher_required_in_group[int(tid)] += int(b.lesson_count)
+                teacher_required_total[int(tid)] += int(b.lesson_count)
+                teacher_group_times[int(tid)].update(g_times)
+
+        for tid, need in teacher_required_in_group.items():
+            available = 0
+            blocked = 0
+            for (wd, ltid) in g_times:
+                if (tid, wd, ltid) in busy_slots:
+                    blocked += 1
+                else:
+                    available += 1
+
+            cap_week = teacher_max.get(tid)
+            teacher_reason = []
+
+            if available == 0 and need > 0:
+                teacher_reason.append("TEACHER_NO_AVAILABLE_SLOTS_IN_GROUP")
+                reasons_counter["TEACHER_NO_AVAILABLE_SLOTS_IN_GROUP"] += 1
+                deficit = need
+                if best_deficit is None or deficit > best_deficit[0]:
+                    best_deficit = (deficit, gid, tid, "TEACHER_NO_AVAILABLE_SLOTS_IN_GROUP",
+                                    {"need": int(need), "available": int(available), "blocked": int(blocked)})
+
+            if cap_week is not None and need > cap_week:
+                teacher_reason.append("TEACHER_WEEK_CAP_TOO_LOW_FOR_SINGLE_GROUP")
+                reasons_counter["TEACHER_WEEK_CAP_TOO_LOW_FOR_SINGLE_GROUP"] += 1
+                deficit = need - cap_week
+                if best_deficit is None or deficit > best_deficit[0]:
+                    best_deficit = (deficit, gid, tid, "TEACHER_WEEK_CAP_TOO_LOW_FOR_SINGLE_GROUP",
+                                    {"need": int(need), "cap_week": int(cap_week)})
+
+            if need > available and not allow_unassigned:
+                teacher_reason.append("TEACHER_NEED_GT_AVAILABLE_TIMES_IN_GROUP")
+                reasons_counter["TEACHER_NEED_GT_AVAILABLE_TIMES_IN_GROUP"] += 1
+                deficit = need - available
+                if best_deficit is None or deficit > best_deficit[0]:
+                    best_deficit = (deficit, gid, tid, "TEACHER_NEED_GT_AVAILABLE_TIMES_IN_GROUP",
+                                    {"need": int(need), "available": int(available), "blocked": int(blocked)})
+
+            if teacher_reason:
+                g_detail["teacher_checks"].append({
+                    "teacher_id": tid,
+                    "need_lessons_in_group": int(need),
+                    "available_times_in_group": int(available),
+                    "blocked_busy_times_in_group": int(blocked),
+                    "teacher_week_cap": cap_week,
+                    "reasons": teacher_reason,
+                })
+
+        g_detail["reasons"] = g_reasons
+        if g_reasons or g_detail["teacher_checks"]:
+            report["groups"].append(g_detail)
+
+    for tid, need_total in teacher_required_total.items():
+        cap_week = teacher_max.get(tid)
+        avail_week = teacher_available_week.get(tid, 0)
+        avail_group = 0
+        if tid in teacher_group_times:
+            avail_group = sum(
+                1 for (wd, ltid) in teacher_group_times[tid]
+                if (tid, wd, ltid) not in busy_slots
+            )
+
+        reasons = []
+        if cap_week is not None and need_total > cap_week:
+            reasons.append("TEACHER_TOTAL_DEMAND_GT_WEEK_CAP")
+            reasons_counter["TEACHER_TOTAL_DEMAND_GT_WEEK_CAP"] += 1
+            deficit = need_total - cap_week
+            if best_deficit is None or deficit > best_deficit[0]:
+                best_deficit = (deficit, 0, tid, "TEACHER_TOTAL_DEMAND_GT_WEEK_CAP",
+                                {"need_total": int(need_total), "cap_week": int(cap_week)})
+
+        if need_total > avail_week:
+            reasons.append("TEACHER_TOTAL_DEMAND_GT_AVAILABLE_WEEK_TIMES")
+            reasons_counter["TEACHER_TOTAL_DEMAND_GT_AVAILABLE_WEEK_TIMES"] += 1
+            deficit = need_total - avail_week
+            if best_deficit is None or deficit > best_deficit[0]:
+                best_deficit = (deficit, 0, tid, "TEACHER_TOTAL_DEMAND_GT_AVAILABLE_WEEK_TIMES",
+                                {"need_total": int(need_total), "available_week_times": int(avail_week)})
+
+        if avail_group and need_total > avail_group:
+            reasons.append("TEACHER_TOTAL_DEMAND_GT_GROUP_AVAILABLE_TIMES")
+            reasons_counter["TEACHER_TOTAL_DEMAND_GT_GROUP_AVAILABLE_TIMES"] += 1
+            deficit = need_total - avail_group
+            if best_deficit is None or deficit > best_deficit[0]:
+                best_deficit = (deficit, 0, tid, "TEACHER_TOTAL_DEMAND_GT_GROUP_AVAILABLE_TIMES",
+                                {"need_total": int(need_total), "available_group_times": int(avail_group)})
+
+        if reasons:
+            report["teacher_global_checks"].append({
+                "teacher_id": tid,
+                "need_total_lessons": int(need_total),
+                "teacher_week_cap": cap_week,
+                "available_week_times": int(avail_week),
+                "available_group_times": int(avail_group),
+                "reasons": reasons,
+            })
+
+    report["top_reasons"] = [{"reason": r, "count": c} for r, c in reasons_counter.most_common(10)]
+    report["global"] = {
+        "groups_total": len(groups),
+        "teachers_busy_unique": len(busy_slots),
+        "teacher_caps_count": len(teacher_max),
+        "all_unique_week_times": len(all_unique_times),
+    }
+
+    if best_deficit is not None:
+        _, gid, tid, reason, detail = best_deficit
+        report["primary_cause"] = {
+            "group_id": gid if gid != 0 else None,
+            "teacher_id": tid,
+            "reason": reason,
+            "detail": detail,
+        }
+
+    return report
+
+
+def print_feasibility_report(report: Dict[str, Any]) -> None:
+    groups_issues = len(report.get("groups", []))
+    teacher_issues = len(report.get("teacher_global_checks", []))
+    primary = report.get("primary_cause")
+    top_reasons = report.get("top_reasons", [])[:5]
+
+    if groups_issues == 0 and teacher_issues == 0 and not primary:
+        print("[feasibility] OK (no issues detected)", file=sys.stderr)
+        print("[feasibility] Summary: Input appears feasible under current strategies.", file=sys.stderr)
+        return
+
+    print(
+        f"[feasibility] issues detected (groups={groups_issues}, teacher_global={teacher_issues})",
+        file=sys.stderr,
+    )
+    if primary:
+        print(f"[feasibility] primary_cause: {primary}", file=sys.stderr)
+    if top_reasons:
+        print(f"[feasibility] top_reasons: {top_reasons}", file=sys.stderr)
+
+    summary_parts = []
+    if primary:
+        reason = primary.get("reason")
+        gid = primary.get("group_id")
+        tid = primary.get("teacher_id")
+        detail = primary.get("detail")
+        who = []
+        if gid is not None:
+            who.append(f"group {gid}")
+        if tid is not None:
+            who.append(f"teacher {tid}")
+        who_str = ", ".join(who) if who else "unknown target"
+        summary_parts.append(f"Primary issue: {reason} ({who_str})")
+        if detail:
+            summary_parts.append(f"detail={detail}")
+    if groups_issues:
+        summary_parts.append(f"groups_with_issues={groups_issues}")
+    if teacher_issues:
+        summary_parts.append(f"teacher_global_issues={teacher_issues}")
+
+    summary = "; ".join(summary_parts) if summary_parts else "Issues detected. See above for details."
+    print(f"[feasibility] Summary: {summary}", file=sys.stderr)
 
 
 def build_model(
@@ -379,6 +665,12 @@ def solve(
         subject_spread_strategy=subject_spread_strategy,
         subject_spread_weight=subject_spread_weight,
     )
+    report = analyze_infeasibility(
+        data,
+        over_capacity_strategy=over_capacity_strategy,
+        subject_spread_strategy=subject_spread_strategy,
+    )
+    print_feasibility_report(report)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
