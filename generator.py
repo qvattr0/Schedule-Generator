@@ -127,6 +127,7 @@ def analyze_infeasibility(
     input_data: dict,
     over_capacity_strategy: str = "unassigned",
     subject_spread_strategy: str = "soft",
+    ignore_availability: bool = False,
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "global": {},
@@ -137,13 +138,14 @@ def analyze_infeasibility(
     }
 
     busy_slots = set()
-    for entry in (input_data.get("teachers_busy") or []):
-        teacher_id = entry.get("teacher_id", entry.get("staff_id"))
-        weekday_id = entry.get("weekday_id")
-        lesson_time_id = entry.get("lesson_time_id")
-        if teacher_id is None or weekday_id is None or lesson_time_id is None:
-            continue
-        busy_slots.add((int(teacher_id), int(weekday_id), int(lesson_time_id)))
+    if not ignore_availability:
+        for entry in (input_data.get("teachers_busy") or []):
+            teacher_id = entry.get("teacher_id", entry.get("staff_id"))
+            weekday_id = entry.get("weekday_id")
+            lesson_time_id = entry.get("lesson_time_id")
+            if teacher_id is None or weekday_id is None or lesson_time_id is None:
+                continue
+            busy_slots.add((int(teacher_id), int(weekday_id), int(lesson_time_id)))
 
     teacher_max = {
         int(t["teacher_id"]): int(t["lesson_week_count_sum"])
@@ -416,6 +418,7 @@ def build_model(
     over_capacity_strategy: str = "unassigned",
     subject_spread_strategy: str = "soft",
     subject_spread_weight: int = 5,
+    ignore_availability: bool = False,
 ):
     model = cp_model.CpModel()
 
@@ -427,13 +430,14 @@ def build_model(
 
     teacher_time_map: Dict[Tuple[int, int, int], List] = collections.defaultdict(list)
     busy_slots = set()
-    for entry in data.get("teachers_busy", []):
-        teacher_id = entry.get("teacher_id", entry.get("staff_id"))
-        weekday_id = entry.get("weekday_id")
-        lesson_time_id = entry.get("lesson_time_id")
-        if teacher_id is None or weekday_id is None or lesson_time_id is None:
-            continue
-        busy_slots.add((teacher_id, weekday_id, lesson_time_id))
+    if not ignore_availability:
+        for entry in data.get("teachers_busy", []):
+            teacher_id = entry.get("teacher_id", entry.get("staff_id"))
+            weekday_id = entry.get("weekday_id")
+            lesson_time_id = entry.get("lesson_time_id")
+            if teacher_id is None or weekday_id is None or lesson_time_id is None:
+                continue
+            busy_slots.add((teacher_id, weekday_id, lesson_time_id))
     teacher_week_map: Dict[int, List] = collections.defaultdict(list)
     teacher_max = {
         t["teacher_id"]: t["lesson_week_count_sum"] for t in data["curriculum_teachers"]
@@ -655,6 +659,7 @@ def solve(
     over_capacity_strategy: str = "unassigned",
     subject_spread_strategy: str = "soft",
     subject_spread_weight: int = 5,
+    ignore_availability: bool = False,
     log: bool = False,
 ):
     model, x, occ, group_info = build_model(
@@ -664,11 +669,13 @@ def solve(
         over_capacity_strategy=over_capacity_strategy,
         subject_spread_strategy=subject_spread_strategy,
         subject_spread_weight=subject_spread_weight,
+        ignore_availability=ignore_availability,
     )
     report = analyze_infeasibility(
         data,
         over_capacity_strategy=over_capacity_strategy,
         subject_spread_strategy=subject_spread_strategy,
+        ignore_availability=ignore_availability,
     )
     print_feasibility_report(report)
 
@@ -770,6 +777,11 @@ def main():
         default=5,
         help="Penalty weight for same-subject proximity (soft/both strategies)",
     )
+    parser.add_argument(
+        "--ignore-availability",
+        action="store_true",
+        help="Ignore teachers_busy constraints when generating a schedule",
+    )
     parser.add_argument("--output", default="schedule.json", help="Output JSON file")
     parser.add_argument(
         "--render",
@@ -799,6 +811,7 @@ def main():
         over_capacity_strategy=args.over_capacity_strategy,
         subject_spread_strategy=args.subject_spread_strategy,
         subject_spread_weight=args.subject_spread_weight,
+        ignore_availability=args.ignore_availability,
         log=args.log,
     )
 
