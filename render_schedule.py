@@ -1,13 +1,8 @@
 import argparse
+import html
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
-
-
-def _fmt_list(items: List[int]) -> str:
-    if not items:
-        return "-"
-    return ", ".join(str(x) for x in items)
+from typing import Dict, Optional, Tuple
 
 
 def _fmt_time(value: str) -> str:
@@ -16,7 +11,104 @@ def _fmt_time(value: str) -> str:
     return value
 
 
-def _render_group(group: dict) -> str:
+def _load_name_maps() -> Tuple[Dict[int, Dict[int, str]], Dict[int, str], Dict[int, str]]:
+    try:
+        from mock_data import data as mock_data
+    except Exception:
+        return {}, {}, {}
+
+    subject_by_group: Dict[int, Dict[int, str]] = {}
+    subject_by_id: Dict[int, str] = {}
+    for item in mock_data.get("curriculum_subjects", []):
+        subject_id = item.get("subject_id")
+        subject_name = item.get("subject_name")
+        if subject_id is None or not subject_name:
+            continue
+        subject_by_id.setdefault(int(subject_id), subject_name)
+        group_id = item.get("group_id")
+        if group_id is None:
+            continue
+        subject_by_group.setdefault(int(group_id), {})
+        subject_by_group[int(group_id)].setdefault(int(subject_id), subject_name)
+
+    teacher_by_id: Dict[int, str] = {}
+    for item in mock_data.get("curriculum_teachers", []):
+        teacher_id = item.get("teacher_id")
+        teacher_name = item.get("teacher_name")
+        if teacher_id is None or not teacher_name:
+            continue
+        teacher_by_id.setdefault(int(teacher_id), teacher_name)
+
+    return subject_by_group, subject_by_id, teacher_by_id
+
+
+def _subject_label(
+    subject_id: Optional[int],
+    group_id: int,
+    subject_by_group: Dict[int, Dict[int, str]],
+    subject_by_id: Dict[int, str],
+) -> str:
+    if subject_id is None:
+        return "Unknown subject"
+    group_subjects = subject_by_group.get(group_id, {})
+    name = group_subjects.get(subject_id) or subject_by_id.get(subject_id)
+    return name or "Unknown subject"
+
+
+def _teacher_label(teacher_id: Optional[int], teacher_by_id: Dict[int, str]) -> str:
+    if teacher_id is None:
+        return "Unknown teacher"
+    return teacher_by_id.get(teacher_id) or "Unknown teacher"
+
+
+def _build_slot_entries(
+    slot: dict,
+    group_id: int,
+    subject_by_group: Dict[int, Dict[int, str]],
+    subject_by_id: Dict[int, str],
+    teacher_by_id: Dict[int, str],
+) -> list:
+    subject_ids = slot.get("subject_ids", [])
+    teacher_ids = slot.get("teacher_ids", [])
+
+    if not subject_ids and not teacher_ids:
+        return []
+
+    if len(subject_ids) == len(teacher_ids):
+        pairs = list(zip(subject_ids, teacher_ids))
+    elif len(subject_ids) == 1 and len(teacher_ids) > 1:
+        pairs = [(subject_ids[0], teacher_id) for teacher_id in teacher_ids]
+    elif len(teacher_ids) == 1 and len(subject_ids) > 1:
+        pairs = [(subject_id, teacher_ids[0]) for subject_id in subject_ids]
+    else:
+        count = max(len(subject_ids), len(teacher_ids))
+        pairs = [
+            (
+                subject_ids[i] if i < len(subject_ids) else None,
+                teacher_ids[i] if i < len(teacher_ids) else None,
+            )
+            for i in range(count)
+        ]
+
+    entries = []
+    for subject_id, teacher_id in pairs:
+        entries.append(
+            {
+                "subject_id": subject_id,
+                "subject_name": _subject_label(subject_id, group_id, subject_by_group, subject_by_id),
+                "teacher_name": _teacher_label(teacher_id, teacher_by_id),
+            }
+        )
+    return entries
+
+
+def _render_group(
+    group: dict,
+    subject_by_group: Dict[int, Dict[int, str]],
+    subject_by_id: Dict[int, str],
+    teacher_by_id: Dict[int, str],
+) -> str:
+    group_id = int(group["group_id"])
     days: Dict[str, dict] = group["days"]
     day_keys = sorted(days.keys(), key=lambda x: int(x))
     day_names = [days[k]["weekday_name"] for k in day_keys]
@@ -46,11 +138,32 @@ def _render_group(group: dict) -> str:
                         if subject_counts_by_day[k].get(subject_id, 0) >= 2:
                             repeat = True
                             break
+                    entries = _build_slot_entries(
+                        slot,
+                        group_id,
+                        subject_by_group,
+                        subject_by_id,
+                        teacher_by_id,
+                    )
+                    items = []
+                    for entry in entries:
+                        subject_name = html.escape(entry["subject_name"])
+                        teacher_name = html.escape(entry["teacher_name"])
+                        subject_id = entry["subject_id"]
+                        tooltip = f"(ID: {subject_id})" if subject_id is not None else ""
+                        tooltip_attr = f' title="{html.escape(tooltip)}"' if tooltip else ""
+                        items.append(
+                            "<div class=\"slot-item\">"
+                            f"<div class=\"subject\"{tooltip_attr}>{subject_name}</div>"
+                            f"<div class=\"teacher\">{teacher_name}</div>"
+                            "</div>"
+                        )
+                    column_count = max(len(items), 1)
                     cell = (
                         f"<div class=\"time\">{_fmt_time(slot['start_time'])}-{_fmt_time(slot['end_time'])}</div>"
-                        f"<div class=\"meta\"><span>S:</span> {_fmt_list(slot['subject_ids'])}</div>"
-                        f"<div class=\"meta\"><span>T:</span> {_fmt_list(slot['teacher_ids'])}</div>"
-                        f"<div class=\"meta\"><span>C:</span> {_fmt_list(slot['curriculum_ids'])}</div>"
+                        f"<div class=\"slot-split\" style=\"--slot-columns: {column_count};\">"
+                        f"{''.join(items)}"
+                        "</div>"
                     )
                     cell_class = "assigned repeat" if repeat else "assigned"
                 else:
@@ -84,6 +197,7 @@ def _render_group(group: dict) -> str:
 
 
 def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
+    subject_by_group, subject_by_id, teacher_by_id = _load_name_maps()
     groups = schedule.get("groups", {})
     if group_id is not None:
         key = str(group_id)
@@ -93,7 +207,9 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
 
     body_sections = []
     for gid in sorted(groups.keys(), key=lambda x: int(x)):
-        body_sections.append(_render_group(groups[gid]))
+        body_sections.append(
+            _render_group(groups[gid], subject_by_group, subject_by_id, teacher_by_id)
+        )
 
     return f"""
 <!doctype html>
@@ -160,6 +276,27 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
     .meta span {{
       color: #3c3c3c;
       font-weight: 600;
+    }}
+    .slot-split {{
+      display: grid;
+      grid-template-columns: repeat(var(--slot-columns, 1), minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 4px;
+    }}
+    .slot-item {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px;
+      background: #faf7f1;
+    }}
+    .subject {{
+      font-weight: 600;
+      margin-bottom: 2px;
+      cursor: help;
+    }}
+    .teacher {{
+      font-size: 12px;
+      color: var(--muted);
     }}
     .empty {{
       color: var(--muted);
