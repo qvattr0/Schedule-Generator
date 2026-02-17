@@ -11,11 +11,16 @@ def _fmt_time(value: str) -> str:
     return value
 
 
-def _load_name_maps() -> Tuple[Dict[int, Dict[int, str]], Dict[int, str], Dict[int, str]]:
+def _load_name_maps() -> Tuple[
+    Dict[int, Dict[int, str]],
+    Dict[int, str],
+    Dict[int, str],
+    Dict[int, str],
+]:
     try:
         from mock_data import data as mock_data
     except Exception:
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     subject_by_group: Dict[int, Dict[int, str]] = {}
     subject_by_id: Dict[int, str] = {}
@@ -39,7 +44,15 @@ def _load_name_maps() -> Tuple[Dict[int, Dict[int, str]], Dict[int, str], Dict[i
             continue
         teacher_by_id.setdefault(int(teacher_id), teacher_name)
 
-    return subject_by_group, subject_by_id, teacher_by_id
+    group_name_by_id: Dict[int, str] = {}
+    for item in mock_data.get("groups_curriculum", []):
+        group_id = item.get("group_id")
+        group_name = item.get("group_name")
+        if group_id is None or not group_name:
+            continue
+        group_name_by_id.setdefault(int(group_id), str(group_name))
+
+    return subject_by_group, subject_by_id, teacher_by_id, group_name_by_id
 
 
 def _subject_label(
@@ -107,8 +120,14 @@ def _render_group(
     subject_by_group: Dict[int, Dict[int, str]],
     subject_by_id: Dict[int, str],
     teacher_by_id: Dict[int, str],
+    group_name_by_id: Dict[int, str],
 ) -> str:
     group_id = int(group["group_id"])
+    group_name = str(
+        group.get("group_name")
+        or group_name_by_id.get(group_id)
+        or f"Group {group_id}"
+    )
     days: Dict[str, dict] = group["days"]
     day_keys = sorted(days.keys(), key=lambda x: int(x))
     day_names = [days[k]["weekday_name"] for k in day_keys]
@@ -193,11 +212,12 @@ def _render_group(
         "</table>"
     )
 
-    return f"<section><h2>Group {group['group_id']}</h2>{table}</section>"
+    title = f"{html.escape(group_name)} GID:{group_id}"
+    return f"<section><h2>{title}</h2>{table}</section>"
 
 
 def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
-    subject_by_group, subject_by_id, teacher_by_id = _load_name_maps()
+    subject_by_group, subject_by_id, teacher_by_id, group_name_by_id = _load_name_maps()
     groups = schedule.get("groups", {})
     if group_id is not None:
         key = str(group_id)
@@ -208,7 +228,13 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
     body_sections = []
     for gid in sorted(groups.keys(), key=lambda x: int(x)):
         body_sections.append(
-            _render_group(groups[gid], subject_by_group, subject_by_id, teacher_by_id)
+            _render_group(
+                groups[gid],
+                subject_by_group,
+                subject_by_id,
+                teacher_by_id,
+                group_name_by_id,
+            )
         )
 
     return f"""

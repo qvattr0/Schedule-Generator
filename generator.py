@@ -583,7 +583,7 @@ def build_model(
 
     teacher_time_map: Dict[Tuple[int, int, int], List] = collections.defaultdict(list)
     busy_slots = set()
-    if not ignore_availability:
+    if not ignore_availability and data["teachers_busy"] is not None:
         for entry in data.get("teachers_busy", []):
             teacher_id = entry.get("teacher_id", entry.get("staff_id"))
             weekday_id = entry.get("weekday_id")
@@ -943,6 +943,7 @@ def solve(
         bundle_by_id = {b.id: b for b in bundles}
         group_entry = {
             "group_id": gid,
+            "group_name": info["group"].get("group_name"),
             "days": {},
         }
 
