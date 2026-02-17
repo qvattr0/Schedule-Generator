@@ -411,6 +411,144 @@ def print_feasibility_report(report: Dict[str, Any]) -> None:
     print(f"[feasibility] Summary: {summary}", file=sys.stderr)
 
 
+def build_unsat_core_report(
+    solver: cp_model.CpSolver,
+    assumption_records: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    core_literals = [int(lit) for lit in solver.sufficient_assumptions_for_infeasibility()]
+    category_counts = collections.Counter()
+    group_counts = collections.Counter()
+    teacher_counts = collections.Counter()
+    teacher_time_counts = collections.Counter()
+    teacher_group_pair_counts = collections.Counter()
+    core_items: List[Dict[str, Any]] = []
+
+    for lit in core_literals:
+        record = dict(assumption_records.get(lit, {"category": "UNKNOWN"}))
+        record["literal"] = lit
+        core_items.append(record)
+
+        category = str(record.get("category", "UNKNOWN"))
+        category_counts[category] += 1
+
+        gid = record.get("group_id")
+        if gid is not None:
+            group_counts[int(gid)] += 1
+
+        tid = record.get("teacher_id")
+        if tid is not None:
+            teacher_counts[int(tid)] += 1
+
+        wd = record.get("weekday_id")
+        ltid = record.get("lesson_time_id")
+        if tid is not None and wd is not None and ltid is not None:
+            teacher_time_counts[(int(tid), int(wd), int(ltid), category)] += 1
+
+        if tid is not None and gid is not None:
+            teacher_group_pair_counts[(int(tid), int(gid))] += 1
+        involved_groups = record.get("involved_groups")
+        if tid is not None and isinstance(involved_groups, list):
+            for g in involved_groups:
+                teacher_group_pair_counts[(int(tid), int(g))] += 1
+
+    return {
+        "core_size": len(core_items),
+        "core_literals": core_literals,
+        "categories": [
+            {"category": category, "count": count}
+            for category, count in category_counts.most_common()
+        ],
+        "groups": [
+            {"group_id": gid, "count": count}
+            for gid, count in sorted(group_counts.items(), key=lambda item: (-item[1], item[0]))
+        ],
+        "teachers": [
+            {"teacher_id": tid, "count": count}
+            for tid, count in sorted(teacher_counts.items(), key=lambda item: (-item[1], item[0]))
+        ],
+        "teacher_time_slots": [
+            {
+                "teacher_id": tid,
+                "weekday_id": wd,
+                "lesson_time_id": ltid,
+                "category": category,
+                "count": count,
+            }
+            for (tid, wd, ltid, category), count in sorted(
+                teacher_time_counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ],
+        "teacher_group_pairs": [
+            {"teacher_id": tid, "group_id": gid, "count": count}
+            for (tid, gid), count in sorted(
+                teacher_group_pair_counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ],
+        "core_items": core_items,
+    }
+
+
+def print_unsat_core_report(report: Dict[str, Any], max_items: int = 20) -> None:
+    core_size = int(report.get("core_size", 0))
+    if core_size <= 0:
+        print("[unsat-core] No assumptions were returned by the solver.", file=sys.stderr)
+        return
+
+    print(
+        f"[unsat-core] Extracted sufficient infeasible core with {core_size} assumption(s).",
+        file=sys.stderr,
+    )
+
+    categories = report.get("categories", [])
+    if categories:
+        top = ", ".join(
+            f"{entry['category']}={entry['count']}" for entry in categories[:8]
+        )
+        print(f"[unsat-core] categories: {top}", file=sys.stderr)
+
+    groups = report.get("groups", [])
+    if groups:
+        top = ", ".join(f"g{entry['group_id']}:{entry['count']}" for entry in groups[:8])
+        print(f"[unsat-core] groups: {top}", file=sys.stderr)
+
+    teachers = report.get("teachers", [])
+    if teachers:
+        top = ", ".join(f"t{entry['teacher_id']}:{entry['count']}" for entry in teachers[:8])
+        print(f"[unsat-core] teachers: {top}", file=sys.stderr)
+
+    teacher_time_slots = report.get("teacher_time_slots", [])
+    if teacher_time_slots:
+        top_slots = teacher_time_slots[:8]
+        text = ", ".join(
+            f"t{entry['teacher_id']}@d{entry['weekday_id']}/lt{entry['lesson_time_id']}"
+            f"({entry['category']}:{entry['count']})"
+            for entry in top_slots
+        )
+        print(f"[unsat-core] teacher_time_hotspots: {text}", file=sys.stderr)
+
+    teacher_group_pairs = report.get("teacher_group_pairs", [])
+    if teacher_group_pairs:
+        top_pairs = teacher_group_pairs[:8]
+        text = ", ".join(
+            f"t{entry['teacher_id']}<->g{entry['group_id']}({entry['count']})"
+            for entry in top_pairs
+        )
+        print(f"[unsat-core] teacher_group_pairs: {text}", file=sys.stderr)
+
+    core_items = report.get("core_items", [])
+    show = max(0, int(max_items))
+    for idx, item in enumerate(core_items[:show], start=1):
+        print(
+            f"[unsat-core] item[{idx}]: {json.dumps(item, sort_keys=True)}",
+            file=sys.stderr,
+        )
+    if len(core_items) > show:
+        print(
+            f"[unsat-core] ... {len(core_items) - show} more core item(s) omitted.",
+            file=sys.stderr,
+        )
+
+
 def build_model(
     gap_weight: int = 10,
     early_weight: int = 1,
@@ -419,8 +557,21 @@ def build_model(
     subject_spread_strategy: str = "soft",
     subject_spread_weight: int = 5,
     ignore_availability: bool = False,
+    diagnose_unsat: bool = False,
 ):
     model = cp_model.CpModel()
+    assumption_records: Optional[Dict[int, Dict[str, Any]]] = {} if diagnose_unsat else None
+
+    def add_labeled_constraint(expr, category: Optional[str] = None, **meta: Any):
+        ct = model.add(expr)
+        if assumption_records is not None and category:
+            a = model.new_bool_var(f"assume_{len(assumption_records)}_{category}")
+            ct.only_enforce_if(a)
+            model.add_assumption(a)
+            payload = {"category": category}
+            payload.update(meta)
+            assumption_records[a.Index()] = payload
+        return ct
 
     # Storage
     x = {}  # (group_id, bundle_id, slot_id) -> BoolVar
@@ -530,11 +681,25 @@ def build_model(
             scheduled = sum(x[(gid, bundle.id, slot.id)] for slot in slots)
             target_count = trimmed_counts[bundle.id]
             if allow_unassigned:
-                model.add(scheduled <= target_count)
+                add_labeled_constraint(
+                    scheduled <= target_count,
+                    category="group_bundle_target",
+                    group_id=gid,
+                    bundle_id=bundle.id,
+                    relation="<=",
+                    target_count=int(target_count),
+                )
                 if unassigned_weight:
                     objective_terms.append(unassigned_weight * (target_count - scheduled))
             else:
-                model.add(scheduled == target_count)
+                add_labeled_constraint(
+                    scheduled == target_count,
+                    category="group_bundle_target",
+                    group_id=gid,
+                    bundle_id=bundle.id,
+                    relation="==",
+                    target_count=int(target_count),
+                )
 
         # Subject distribution constraints/penalties within a day.
         if spread_soft or spread_hard:
@@ -571,7 +736,16 @@ def build_model(
                             occ_exprs.append(sum(vars_for_slot))
 
                     if spread_hard and occ_exprs:
-                        model.add(sum(occ_exprs) <= max_per_day_subject)
+                        weekday_id = slots[slot_ids[0]].weekday_id if slot_ids else None
+                        add_labeled_constraint(
+                            sum(occ_exprs) <= max_per_day_subject,
+                            category="group_subject_daily_limit",
+                            group_id=gid,
+                            subject_id=subject_id,
+                            day_index=day_index,
+                            weekday_id=weekday_id,
+                            max_per_day_subject=int(max_per_day_subject),
+                        )
 
                     if spread_soft and len(occ_vars) >= 2:
                         day_len = len(occ_vars)
@@ -592,7 +766,15 @@ def build_model(
         for slot_ids in day_slots:
             if not slot_ids:
                 continue
-            model.add(sum(occ[(gid, sid)] for sid in slot_ids) <= max_per_day)
+            weekday_id = slots[slot_ids[0]].weekday_id
+            add_labeled_constraint(
+                sum(occ[(gid, sid)] for sid in slot_ids) <= max_per_day,
+                category="group_max_lessons_per_day",
+                group_id=gid,
+                weekday_id=weekday_id,
+                max_per_day=int(max_per_day),
+                slots_in_day=len(slot_ids),
+            )
 
         # Gaps per day (soft): empty slot between two occupied slots.
         if gap_weight:
@@ -660,6 +842,8 @@ def solve(
     subject_spread_strategy: str = "soft",
     subject_spread_weight: int = 5,
     ignore_availability: bool = False,
+    diagnose_unsat: bool = False,
+    unsat_core_max_items: int = 20,
     log: bool = False,
 ):
     model, x, occ, group_info = build_model(
@@ -670,6 +854,7 @@ def solve(
         subject_spread_strategy=subject_spread_strategy,
         subject_spread_weight=subject_spread_weight,
         ignore_availability=ignore_availability,
+        diagnose_unsat=diagnose_unsat,
     )
     report = analyze_infeasibility(
         data,
@@ -687,6 +872,9 @@ def solve(
 
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if status == cp_model.INFEASIBLE and diagnose_unsat and assumption_records:
+            core_report = build_unsat_core_report(solver, assumption_records)
+            print_unsat_core_report(core_report, max_items=unsat_core_max_items)
         return None, status, None
 
     schedule = {"groups": {}}
@@ -782,6 +970,17 @@ def main():
         action="store_true",
         help="Ignore teachers_busy constraints when generating a schedule",
     )
+    parser.add_argument(
+        "--diagnose-unsat",
+        action="store_true",
+        help="When infeasible, extract and print an assumption-based unsat core summary",
+    )
+    parser.add_argument(
+        "--unsat-core-max-items",
+        type=int,
+        default=20,
+        help="How many individual unsat-core constraints to print when --diagnose-unsat is enabled",
+    )
     parser.add_argument("--output", default="schedule.json", help="Output JSON file")
     parser.add_argument(
         "--render",
@@ -812,6 +1011,8 @@ def main():
         subject_spread_strategy=args.subject_spread_strategy,
         subject_spread_weight=args.subject_spread_weight,
         ignore_availability=args.ignore_availability,
+        diagnose_unsat=args.diagnose_unsat,
+        unsat_core_max_items=args.unsat_core_max_items,
         log=args.log,
     )
 
