@@ -32,6 +32,10 @@ class Slot:
     end_time: str
 
 
+class DataValidationError(RuntimeError):
+    pass
+
+
 def _build_bundles(curriculum_data: List[dict]) -> Tuple[List[Bundle], Dict[int, int]]:
     parent = {cd["curriculum_id"]: cd["curriculum_id"] for cd in curriculum_data}
 
@@ -121,6 +125,131 @@ def _trim_bundle_counts(bundles: List[Bundle], capacity: int) -> Tuple[Dict[int,
 
     trimmed = required - sum(counts.values())
     return counts, trimmed
+
+
+def validate_teacher_week_count_sum_consistency(input_data: dict) -> Dict[str, Any]:
+    teacher_declared: Dict[int, int] = {}
+    teacher_names: Dict[int, str] = {}
+    teacher_declared_rows: Dict[int, List[int]] = collections.defaultdict(list)
+
+    for t in (input_data.get("curriculum_teachers") or []):
+        tid = t.get("teacher_id")
+        if tid is None:
+            continue
+        tid = int(tid)
+        teacher_name = (
+            t.get("teacher_name")
+            or t.get("name")
+            or t.get("full_name")
+            or t.get("staff_name")
+            or "Unknown"
+        )
+        teacher_names[tid] = str(teacher_name)
+        declared = int(t.get("lesson_week_count_sum", 0) or 0)
+        teacher_declared_rows[tid].append(declared)
+        if tid not in teacher_declared:
+            teacher_declared[tid] = declared
+
+    teacher_aggregated: Dict[int, int] = collections.defaultdict(int)
+    teacher_group_breakdown: Dict[int, Dict[int, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+    teacher_group_names: Dict[int, Dict[int, str]] = collections.defaultdict(dict)
+    teacher_curriculum_rows: Dict[int, int] = collections.defaultdict(int)
+
+    for group in (input_data.get("groups_curriculum") or []):
+        gid = group.get("group_id")
+        if gid is None:
+            continue
+        gid = int(gid)
+        gname = str(group.get("group_name") or "")
+        for cd in (group.get("curriculum_data") or []):
+            tid = cd.get("teacher_id")
+            if tid is None:
+                continue
+            tid = int(tid)
+            count = int(cd.get("lessom_week_count", 0) or 0)
+            teacher_aggregated[tid] += count
+            teacher_group_breakdown[tid][gid] += count
+            teacher_group_names[tid][gid] = gname
+            teacher_curriculum_rows[tid] += 1
+
+    all_teacher_ids = sorted(set(teacher_declared.keys()) | set(teacher_aggregated.keys()))
+    mismatches: List[Dict[str, Any]] = []
+
+    for tid in all_teacher_ids:
+        declared = teacher_declared.get(tid)
+        aggregated = int(teacher_aggregated.get(tid, 0))
+        duplicate_declared_rows = teacher_declared_rows.get(tid, [])
+        reason = None
+
+        if declared is None:
+            reason = "MISSING_CURRICULUM_TEACHER_ENTRY"
+            declared = 0
+        elif len(duplicate_declared_rows) > 1 and len(set(duplicate_declared_rows)) > 1:
+            reason = "DUPLICATE_CURRICULUM_TEACHER_ENTRIES_CONFLICT"
+        elif int(declared) != aggregated:
+            reason = "DECLARED_SUM_MISMATCH"
+
+        if reason is None:
+            continue
+
+        groups = [
+            {
+                "group_id": gid,
+                "group_name": teacher_group_names.get(tid, {}).get(gid, ""),
+                "aggregated_lessom_week_count": int(cnt),
+            }
+            for gid, cnt in sorted(teacher_group_breakdown.get(tid, {}).items())
+        ]
+        mismatches.append(
+            {
+                "teacher_id": tid,
+                "teacher_name": teacher_names.get(tid, "Unknown"),
+                "declared_lesson_week_count_sum": int(declared),
+                "aggregated_lessom_week_count": int(aggregated),
+                "difference_declared_minus_aggregated": int(declared - aggregated),
+                "curriculum_rows_count": int(teacher_curriculum_rows.get(tid, 0)),
+                "declared_rows": [int(v) for v in duplicate_declared_rows],
+                "group_breakdown": groups,
+                "reason": reason,
+            }
+        )
+
+    return {
+        "checked_teachers": len(all_teacher_ids),
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches,
+    }
+
+
+def format_teacher_week_count_sum_validation_error(report: Dict[str, Any]) -> str:
+    mismatches = report.get("mismatches", [])
+    lines = [
+        "[critical] Validation failed: teacher lesson_week_count_sum consistency check.",
+        "[critical] Optimizer stopped before solving because declared teacher caps do not match aggregated curriculum demand.",
+        f"[critical] checked_teachers={report.get('checked_teachers', 0)}, mismatches={report.get('mismatch_count', 0)}",
+    ]
+
+    for m in mismatches:
+        lines.append(
+            "[critical] "
+            f"teacher_id={m['teacher_id']} teacher_name={m['teacher_name']} "
+            f"declared_lesson_week_count_sum={m['declared_lesson_week_count_sum']} "
+            f"aggregated_lessom_week_count={m['aggregated_lessom_week_count']} "
+            f"difference={m['difference_declared_minus_aggregated']} "
+            f"curriculum_rows={m['curriculum_rows_count']} reason={m['reason']}"
+        )
+        if m.get("declared_rows"):
+            lines.append(
+                f"[critical]   declared_rows={m['declared_rows']}"
+            )
+        if m.get("group_breakdown"):
+            group_parts = [
+                f"group_id={g['group_id']} group_name={g['group_name']} aggregated_lessom_week_count={g['aggregated_lessom_week_count']}"
+                for g in m["group_breakdown"]
+            ]
+            lines.append(f"[critical]   group_breakdown: {'; '.join(group_parts)}")
+
+    return "\n".join(lines)
 
 
 def analyze_infeasibility(
@@ -591,10 +720,6 @@ def build_model(
             if teacher_id is None or weekday_id is None or lesson_time_id is None:
                 continue
             busy_slots.add((teacher_id, weekday_id, lesson_time_id))
-    teacher_week_map: Dict[int, List] = collections.defaultdict(list)
-    teacher_max = {
-        t["teacher_id"]: t["lesson_week_count_sum"] for t in data["curriculum_teachers"]
-    }
     group_info = {}
 
     for group in data["groups_curriculum"]:
@@ -629,7 +754,6 @@ def build_model(
                     teacher_id = teacher_ids[0]
                     assignment_var_meta[var.Index()] = (gid, bundle.id, slot.id)
                     teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(var)
-                    teacher_week_map[teacher_id].append(var)
                 elif len(teacher_ids) > 1:
                     choice_vars = []
                     for teacher_id in teacher_ids:
@@ -640,7 +764,6 @@ def build_model(
                         choice_vars.append(tvar)
                         assignment_var_meta[tvar.Index()] = (gid, bundle.id, slot.id)
                         teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(tvar)
-                        teacher_week_map[teacher_id].append(tvar)
                         model.add(tvar <= var)
                     model.add(sum(choice_vars) == var)
 
@@ -866,24 +989,6 @@ def build_model(
                 involved_group_count=len(involved_groups),
             )
 
-    # Teacher weekly load caps.
-    for teacher_id, vars_for_teacher in teacher_week_map.items():
-        max_week = teacher_max.get(teacher_id)
-        if max_week is not None:
-            involved_groups = sorted({
-                assignment_var_meta[v.Index()][0]
-                for v in vars_for_teacher
-                if v.Index() in assignment_var_meta
-            })
-            add_labeled_constraint(
-                sum(vars_for_teacher) <= max_week,
-                category="teacher_week_cap",
-                teacher_id=int(teacher_id),
-                max_week=int(max_week),
-                involved_groups=involved_groups,
-                involved_group_count=len(involved_groups),
-            )
-
     if objective_terms:
         model.minimize(sum(objective_terms))
 
@@ -903,6 +1008,12 @@ def solve(
     unsat_core_max_items: int = 20,
     log: bool = False,
 ):
+    teacher_sum_validation = validate_teacher_week_count_sum_consistency(data)
+    if teacher_sum_validation.get("mismatch_count", 0) > 0:
+        raise DataValidationError(
+            format_teacher_week_count_sum_validation_error(teacher_sum_validation)
+        )
+
     model, x, teacher_choice, occ, group_info, assumption_records = build_model(
         gap_weight=gap_weight,
         early_weight=early_weight,
@@ -1069,19 +1180,23 @@ def main():
     parser.add_argument("--log", action="store_true", help="Enable solver log output")
     args = parser.parse_args()
 
-    schedule, status, objective = solve(
-        time_limit=args.time_limit,
-        gap_weight=args.gap_weight,
-        early_weight=args.early_weight,
-        unassigned_weight=args.unassigned_weight,
-        over_capacity_strategy=args.over_capacity_strategy,
-        subject_spread_strategy=args.subject_spread_strategy,
-        subject_spread_weight=args.subject_spread_weight,
-        ignore_availability=args.ignore_availability,
-        diagnose_unsat=args.diagnose_unsat,
-        unsat_core_max_items=args.unsat_core_max_items,
-        log=args.log,
-    )
+    try:
+        schedule, status, objective = solve(
+            time_limit=args.time_limit,
+            gap_weight=args.gap_weight,
+            early_weight=args.early_weight,
+            unassigned_weight=args.unassigned_weight,
+            over_capacity_strategy=args.over_capacity_strategy,
+            subject_spread_strategy=args.subject_spread_strategy,
+            subject_spread_weight=args.subject_spread_weight,
+            ignore_availability=args.ignore_availability,
+            diagnose_unsat=args.diagnose_unsat,
+            unsat_core_max_items=args.unsat_core_max_items,
+            log=args.log,
+        )
+    except DataValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
 
     if schedule is None:
         print(f"No feasible solution found. Status: {status}", file=sys.stderr)
