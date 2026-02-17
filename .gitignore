@@ -4,3 +4,5 @@ __pycache__
 # project-specific output files
 schedule.html
 schedule.json
+
+mock_data.py
