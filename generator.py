@@ -5,7 +5,7 @@ import sys
 import webbrowser
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from ortools.sat.python import cp_model
 from mock_data import data as data
 from render_schedule import render_schedule
@@ -575,9 +575,11 @@ def build_model(
 
     # Storage
     x = {}  # (group_id, bundle_id, slot_id) -> BoolVar
+    teacher_choice = {}  # (group_id, bundle_id, slot_id, teacher_id) -> BoolVar
     occ = {}  # (group_id, slot_id) -> BoolVar
     gap_vars = []
     objective_terms = []
+    assignment_var_meta: Dict[int, Tuple[int, int, int]] = {}
 
     teacher_time_map: Dict[Tuple[int, int, int], List] = collections.defaultdict(list)
     busy_slots = set()
@@ -622,10 +624,25 @@ def build_model(
                 x[(gid, bundle.id, slot.id)] = var
                 slot_to_xs[slot.id].append(var)
 
-                # Teacher conflict collection
-                for teacher_id in bundle.teacher_ids:
+                teacher_ids = sorted(set(bundle.teacher_ids))
+                if len(teacher_ids) == 1:
+                    teacher_id = teacher_ids[0]
+                    assignment_var_meta[var.Index()] = (gid, bundle.id, slot.id)
                     teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(var)
                     teacher_week_map[teacher_id].append(var)
+                elif len(teacher_ids) > 1:
+                    choice_vars = []
+                    for teacher_id in teacher_ids:
+                        tvar = model.new_bool_var(
+                            f"teach_g{gid}_b{bundle.id}_s{slot.id}_t{teacher_id}"
+                        )
+                        teacher_choice[(gid, bundle.id, slot.id, teacher_id)] = tvar
+                        choice_vars.append(tvar)
+                        assignment_var_meta[tvar.Index()] = (gid, bundle.id, slot.id)
+                        teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(tvar)
+                        teacher_week_map[teacher_id].append(tvar)
+                        model.add(tvar <= var)
+                    model.add(sum(choice_vars) == var)
 
         for slot in slots:
             occ_var = model.new_bool_var(f"occ_g{gid}_s{slot.id}")
@@ -811,26 +828,66 @@ def build_model(
                     objective_terms.append(gap_weight * gap)
 
     # Teacher conflict constraints across all groups.
-    for vars_for_slot in teacher_time_map.values():
+    for (teacher_id, weekday_id, lesson_time_id), vars_for_slot in teacher_time_map.items():
         if len(vars_for_slot) > 1:
-            model.add(sum(vars_for_slot) <= 1)
+            involved_groups = sorted({
+                assignment_var_meta[v.Index()][0]
+                for v in vars_for_slot
+                if v.Index() in assignment_var_meta
+            })
+            add_labeled_constraint(
+                sum(vars_for_slot) <= 1,
+                category="teacher_time_conflict",
+                teacher_id=int(teacher_id),
+                weekday_id=int(weekday_id),
+                lesson_time_id=int(lesson_time_id),
+                competing_assignments=len(vars_for_slot),
+                involved_groups=involved_groups,
+                involved_group_count=len(involved_groups),
+            )
 
     # Teacher availability constraints.
-    for key in busy_slots:
-        vars_for_slot = teacher_time_map.get(key)
+    for (teacher_id, weekday_id, lesson_time_id) in busy_slots:
+        vars_for_slot = teacher_time_map.get((teacher_id, weekday_id, lesson_time_id))
         if vars_for_slot:
-            model.add(sum(vars_for_slot) == 0)
+            involved_groups = sorted({
+                assignment_var_meta[v.Index()][0]
+                for v in vars_for_slot
+                if v.Index() in assignment_var_meta
+            })
+            add_labeled_constraint(
+                sum(vars_for_slot) == 0,
+                category="teacher_busy_block",
+                teacher_id=int(teacher_id),
+                weekday_id=int(weekday_id),
+                lesson_time_id=int(lesson_time_id),
+                conflicting_assignments=len(vars_for_slot),
+                involved_groups=involved_groups,
+                involved_group_count=len(involved_groups),
+            )
 
     # Teacher weekly load caps.
     for teacher_id, vars_for_teacher in teacher_week_map.items():
         max_week = teacher_max.get(teacher_id)
         if max_week is not None:
-            model.add(sum(vars_for_teacher) <= max_week)
+            involved_groups = sorted({
+                assignment_var_meta[v.Index()][0]
+                for v in vars_for_teacher
+                if v.Index() in assignment_var_meta
+            })
+            add_labeled_constraint(
+                sum(vars_for_teacher) <= max_week,
+                category="teacher_week_cap",
+                teacher_id=int(teacher_id),
+                max_week=int(max_week),
+                involved_groups=involved_groups,
+                involved_group_count=len(involved_groups),
+            )
 
     if objective_terms:
         model.minimize(sum(objective_terms))
 
-    return model, x, occ, group_info
+    return model, x, teacher_choice, occ, group_info, assumption_records
 
 
 def solve(
@@ -846,7 +903,7 @@ def solve(
     unsat_core_max_items: int = 20,
     log: bool = False,
 ):
-    model, x, occ, group_info = build_model(
+    model, x, teacher_choice, occ, group_info, assumption_records = build_model(
         gap_weight=gap_weight,
         early_weight=early_weight,
         unassigned_weight=unassigned_weight,
@@ -913,7 +970,16 @@ def solve(
                 else:
                     b = bundle_by_id[b_id]
                     curriculum_ids = b.curriculum_ids
-                    teacher_ids = b.teacher_ids
+                    if len(b.teacher_ids) <= 1:
+                        teacher_ids = b.teacher_ids
+                    else:
+                        teacher_ids = [
+                            tid
+                            for tid in b.teacher_ids
+                            if solver.Value(teacher_choice[(gid, b_id, sid, tid)])
+                        ]
+                        if not teacher_ids:
+                            teacher_ids = b.teacher_ids
                     subject_ids = b.subject_ids
                 entries.append(
                     {
