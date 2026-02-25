@@ -681,6 +681,7 @@ def print_unsat_core_report(report: Dict[str, Any], max_items: int = 20) -> None
 def build_model(
     gap_weight: int = 10,
     early_weight: int = 1,
+    daily_balance_weight: int = 5,
     unassigned_weight: int = 1000,
     over_capacity_strategy: str = "unassigned",
     subject_spread_strategy: str = "soft",
@@ -689,6 +690,13 @@ def build_model(
     diagnose_unsat: bool = False,
 ):
     model = cp_model.CpModel()
+    new_int_var: Any = getattr(model, "new_int_var", None)
+    if new_int_var is None:
+        new_int_var = getattr(model, "NewIntVar")
+
+    add_abs_equality: Any = getattr(model, "add_abs_equality", None)
+    if add_abs_equality is None:
+        add_abs_equality = getattr(model, "AddAbsEquality")
     assumption_records: Optional[Dict[int, Dict[str, Any]]] = {} if diagnose_unsat else None
 
     def add_labeled_constraint(expr, category: Optional[str] = None, **meta: Any):
@@ -916,6 +924,30 @@ def build_model(
                 slots_in_day=len(slot_ids),
             )
 
+        # Daily load balancing (soft): penalize uneven lessons across days.
+        if daily_balance_weight > 0:
+            daily_loads: List[Tuple[Any, int]] = []
+            for day_index, slot_ids in enumerate(day_slots):
+                if not slot_ids:
+                    continue
+                day_load_ub = min(max_per_day, len(slot_ids))
+                day_load = new_int_var(0, day_load_ub, f"day_load_g{gid}_d{day_index}")
+                model.add(day_load == sum(occ[(gid, sid)] for sid in slot_ids))
+                daily_loads.append((day_load, day_load_ub))
+
+            if len(daily_loads) >= 2:
+                for i in range(len(daily_loads) - 1):
+                    day_load_i, ub_i = daily_loads[i]
+                    for j in range(i + 1, len(daily_loads)):
+                        day_load_j, ub_j = daily_loads[j]
+                        diff = new_int_var(
+                            0,
+                            max(ub_i, ub_j),
+                            f"day_load_diff_g{gid}_{i}_{j}",
+                        )
+                        add_abs_equality(diff, day_load_i - day_load_j)
+                        objective_terms.append(daily_balance_weight * diff)
+
         # Gaps per day (soft): empty slot between two occupied slots.
         if gap_weight:
             for slot_ids in day_slots:
@@ -999,6 +1031,7 @@ def solve(
     time_limit: int = 60,
     gap_weight: int = 10,
     early_weight: int = 1,
+    daily_balance_weight: int = 5,
     unassigned_weight: int = 1000,
     over_capacity_strategy: str = "unassigned",
     subject_spread_strategy: str = "soft",
@@ -1017,6 +1050,7 @@ def solve(
     model, x, teacher_choice, occ, group_info, assumption_records = build_model(
         gap_weight=gap_weight,
         early_weight=early_weight,
+        daily_balance_weight=daily_balance_weight,
         unassigned_weight=unassigned_weight,
         over_capacity_strategy=over_capacity_strategy,
         subject_spread_strategy=subject_spread_strategy,
@@ -1120,6 +1154,12 @@ def main():
     parser.add_argument("--gap-weight", type=int, default=10, help="Weight for gap minimization")
     parser.add_argument("--early-weight", type=int, default=1, help="Weight for early-slot preference")
     parser.add_argument(
+        "--daily-balance-weight",
+        type=int,
+        default=5,
+        help="Penalty weight for uneven daily lesson distribution per group across the week",
+    )
+    parser.add_argument(
         "--unassigned-weight",
         type=int,
         default=1000,
@@ -1185,6 +1225,7 @@ def main():
             time_limit=args.time_limit,
             gap_weight=args.gap_weight,
             early_weight=args.early_weight,
+            daily_balance_weight=args.daily_balance_weight,
             unassigned_weight=args.unassigned_weight,
             over_capacity_strategy=args.over_capacity_strategy,
             subject_spread_strategy=args.subject_spread_strategy,
