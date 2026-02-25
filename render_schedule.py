@@ -212,7 +212,10 @@ def _render_group(
         "</table>"
     )
 
-    title = f"{html.escape(group_name)} GID:{group_id}"
+    title = (
+        f"{html.escape(group_name)} "
+        f"<span class=\"gid-badge\">GID: {group_id}</span>"
+    )
     return f"<section><h2>{title}</h2>{table}</section>"
 
 
@@ -265,6 +268,18 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
     h2 {{
       margin: 32px 0 12px;
       font-size: 22px;
+    }}
+    .gid-badge {{
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #f3efe7;
+      color: #3c3c3c;
+      font-size: 13px;
+      font-weight: 600;
+      vertical-align: middle;
     }}
     table {{
       width: 100%;
