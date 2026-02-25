@@ -690,13 +690,6 @@ def build_model(
     diagnose_unsat: bool = False,
 ):
     model = cp_model.CpModel()
-    new_int_var: Any = getattr(model, "new_int_var", None)
-    if new_int_var is None:
-        new_int_var = getattr(model, "NewIntVar")
-
-    add_abs_equality: Any = getattr(model, "add_abs_equality", None)
-    if add_abs_equality is None:
-        add_abs_equality = getattr(model, "AddAbsEquality")
     assumption_records: Optional[Dict[int, Dict[str, Any]]] = {} if diagnose_unsat else None
 
     def add_labeled_constraint(expr, category: Optional[str] = None, **meta: Any):
@@ -931,7 +924,7 @@ def build_model(
                 if not slot_ids:
                     continue
                 day_load_ub = min(max_per_day, len(slot_ids))
-                day_load = new_int_var(0, day_load_ub, f"day_load_g{gid}_d{day_index}")
+                day_load = model.new_int_var(0, day_load_ub, f"day_load_g{gid}_d{day_index}")
                 model.add(day_load == sum(occ[(gid, sid)] for sid in slot_ids))
                 daily_loads.append((day_load, day_load_ub))
 
@@ -940,12 +933,12 @@ def build_model(
                     day_load_i, ub_i = daily_loads[i]
                     for j in range(i + 1, len(daily_loads)):
                         day_load_j, ub_j = daily_loads[j]
-                        diff = new_int_var(
+                        diff = model.new_int_var(
                             0,
                             max(ub_i, ub_j),
                             f"day_load_diff_g{gid}_{i}_{j}",
                         )
-                        add_abs_equality(diff, day_load_i - day_load_j)
+                        model.add_abs_equality(diff, day_load_i - day_load_j)
                         objective_terms.append(daily_balance_weight * diff)
 
         # Gaps per day (soft): empty slot between two occupied slots.
