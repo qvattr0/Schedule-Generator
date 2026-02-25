@@ -212,11 +212,22 @@ def _render_group(
         "</table>"
     )
 
-    title = (
-        f"{html.escape(group_name)} "
-        f"<span class=\"gid-badge\">GID: {group_id}</span>"
+    gid_badge = (
+        "<span class=\"gid-badge\" title=\"Group ID\">"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" "
+        "viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" "
+        "stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" "
+        "class=\"lucide lucide-users-icon lucide-users\">"
+        "<path d=\"M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2\"/>"
+        "<path d=\"M16 3.128a4 4 0 0 1 0 7.744\"/>"
+        "<path d=\"M22 21v-2a4 4 0 0 0-3-3.87\"/>"
+        "<circle cx=\"9\" cy=\"7\" r=\"4\"/>"
+        "</svg>"
+        f"<span>{group_id}</span>"
+        "</span>"
     )
-    return f"<section><h2>{title}</h2>{table}</section>"
+    title = f"<span>{html.escape(group_name)}</span>{gid_badge}"
+    return f"<section><h2 class=\"group-title\">{title}</h2>{table}</section>"
 
 
 def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
@@ -259,7 +270,7 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
       margin: 24px;
       background: var(--bg);
       color: var(--ink);
-      font-family: ui-serif, Georgia, "Times New Roman", serif;
+      font-family: "TT Rounds Neue", "TT Rounds Nue", ui-serif, Georgia, "Times New Roman", serif;
     }}
     h1 {{
       font-size: 28px;
@@ -269,9 +280,17 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
       margin: 32px 0 12px;
       font-size: 22px;
     }}
+    .group-title {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      line-height: 1.2;
+    }}
     .gid-badge {{
-      display: inline-block;
-      margin-left: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
       padding: 2px 8px;
       border: 1px solid var(--line);
       border-radius: 4px;
@@ -279,7 +298,13 @@ def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
       color: #3c3c3c;
       font-size: 13px;
       font-weight: 600;
-      vertical-align: middle;
+      line-height: 1;
+    }}
+    .gid-badge svg {{
+      flex: 0 0 auto;
+      display: block;
+      width: 14px;
+      height: 14px;
     }}
     table {{
       width: 100%;
