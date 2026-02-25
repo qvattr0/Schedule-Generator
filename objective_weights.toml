@@ -1,0 +1,5 @@
+gap_weight = 10
+early_weight = 3
+daily_balance_weight = 3
+unassigned_weight = 1000
+subject_spread_weight = 5

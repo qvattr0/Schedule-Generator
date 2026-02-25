@@ -10,6 +10,11 @@ from ortools.sat.python import cp_model
 from mock_data import data as data
 from render_schedule import render_schedule
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - depends on Python version
+    tomllib = None
+
 
 @dataclass(frozen=True)
 class Bundle:
@@ -34,6 +39,74 @@ class Slot:
 
 class DataValidationError(RuntimeError):
     pass
+
+
+class ObjectiveWeightConfigError(RuntimeError):
+    pass
+
+
+OBJECTIVE_WEIGHT_DEFAULTS: Dict[str, int] = {
+    "gap_weight": 10,
+    "early_weight": 1,
+    "daily_balance_weight": 5,
+    "unassigned_weight": 1000,
+    "subject_spread_weight": 5,
+}
+OBJECTIVE_WEIGHTS_CONFIG_PATH = Path(__file__).with_name("objective_weights.toml")
+
+
+def load_objective_weight_config(config_path: Path = OBJECTIVE_WEIGHTS_CONFIG_PATH) -> Dict[str, int]:
+    if not config_path.exists():
+        return {}
+
+    if tomllib is None:
+        raise ObjectiveWeightConfigError(
+            "TOML config support requires Python 3.11+ (tomllib). "
+            f"Cannot read {config_path}."
+        )
+
+    try:
+        payload_text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ObjectiveWeightConfigError(
+            f"Failed to read objective weights config {config_path}: {exc}"
+        ) from exc
+
+    try:
+        payload = tomllib.loads(payload_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ObjectiveWeightConfigError(
+            f"Failed to read objective weights config {config_path}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise ObjectiveWeightConfigError(
+            f"Objective weights config {config_path} must contain a TOML table."
+        )
+
+    resolved: Dict[str, int] = {}
+    for key in OBJECTIVE_WEIGHT_DEFAULTS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ObjectiveWeightConfigError(
+                f"Objective weights config {config_path} has invalid value for '{key}': "
+                f"expected integer, got {type(value).__name__}."
+            )
+        resolved[key] = int(value)
+
+    return resolved
+
+
+def apply_objective_weight_precedence(args: argparse.Namespace) -> None:
+    if all(getattr(args, key) is not None for key in OBJECTIVE_WEIGHT_DEFAULTS):
+        return
+
+    config_weights = load_objective_weight_config()
+    for key, default_value in OBJECTIVE_WEIGHT_DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, config_weights.get(key, default_value))
 
 
 def _build_bundles(curriculum_data: List[dict]) -> Tuple[List[Bundle], Dict[int, int]]:
@@ -1144,19 +1217,45 @@ def solve(
 def main():
     parser = argparse.ArgumentParser(description="Generate timetable with OR-Tools CP-SAT")
     parser.add_argument("--time-limit", type=int, default=60, help="Max solve time in seconds")
-    parser.add_argument("--gap-weight", type=int, default=10, help="Weight for gap minimization")
-    parser.add_argument("--early-weight", type=int, default=1, help="Weight for early-slot preference")
+    parser.add_argument(
+        "--gap-weight",
+        type=int,
+        default=None,
+        help=(
+            "Weight for gap minimization "
+            f"(CLI overrides {OBJECTIVE_WEIGHTS_CONFIG_PATH.name}; built-in default: "
+            f"{OBJECTIVE_WEIGHT_DEFAULTS['gap_weight']})"
+        ),
+    )
+    parser.add_argument(
+        "--early-weight",
+        type=int,
+        default=None,
+        help=(
+            "Weight for early-slot preference "
+            f"(CLI overrides {OBJECTIVE_WEIGHTS_CONFIG_PATH.name}; built-in default: "
+            f"{OBJECTIVE_WEIGHT_DEFAULTS['early_weight']})"
+        ),
+    )
     parser.add_argument(
         "--daily-balance-weight",
         type=int,
-        default=5,
-        help="Penalty weight for uneven daily lesson distribution per group across the week",
+        default=None,
+        help=(
+            "Penalty weight for uneven daily lesson distribution per group across the week "
+            f"(CLI overrides {OBJECTIVE_WEIGHTS_CONFIG_PATH.name}; built-in default: "
+            f"{OBJECTIVE_WEIGHT_DEFAULTS['daily_balance_weight']})"
+        ),
     )
     parser.add_argument(
         "--unassigned-weight",
         type=int,
-        default=1000,
-        help="Penalty weight for unassigned lessons when a group is over capacity",
+        default=None,
+        help=(
+            "Penalty weight for unassigned lessons when a group is over capacity "
+            f"(CLI overrides {OBJECTIVE_WEIGHTS_CONFIG_PATH.name}; built-in default: "
+            f"{OBJECTIVE_WEIGHT_DEFAULTS['unassigned_weight']})"
+        ),
     )
     parser.add_argument(
         "--over-capacity-strategy",
@@ -1173,8 +1272,12 @@ def main():
     parser.add_argument(
         "--subject-spread-weight",
         type=int,
-        default=5,
-        help="Penalty weight for same-subject proximity (soft/both strategies)",
+        default=None,
+        help=(
+            "Penalty weight for same-subject proximity (soft/both strategies) "
+            f"(CLI overrides {OBJECTIVE_WEIGHTS_CONFIG_PATH.name}; built-in default: "
+            f"{OBJECTIVE_WEIGHT_DEFAULTS['subject_spread_weight']})"
+        ),
     )
     parser.add_argument(
         "--ignore-availability",
@@ -1212,8 +1315,8 @@ def main():
     )
     parser.add_argument("--log", action="store_true", help="Enable solver log output")
     args = parser.parse_args()
-
     try:
+        apply_objective_weight_precedence(args)
         schedule, status, objective = solve(
             time_limit=args.time_limit,
             gap_weight=args.gap_weight,
@@ -1229,6 +1332,9 @@ def main():
             log=args.log,
         )
     except DataValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    except ObjectiveWeightConfigError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)
 
