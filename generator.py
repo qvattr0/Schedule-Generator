@@ -53,6 +53,8 @@ OBJECTIVE_WEIGHT_DEFAULTS: Dict[str, int] = {
     "subject_spread_weight": 5,
 }
 OBJECTIVE_WEIGHTS_CONFIG_PATH = Path(__file__).with_name("objective_weights.toml")
+SOLVER_PROFILE_CHOICES = ("default", "first-feasible")
+CP_MODEL_PRESOLVE_CHOICES = ("auto", "on", "off")
 
 
 def load_objective_weight_config(config_path: Path = OBJECTIVE_WEIGHTS_CONFIG_PATH) -> Dict[str, int]:
@@ -763,12 +765,15 @@ def build_model(
     diagnose_unsat: bool = False,
 ):
     model = cp_model.CpModel()
+    add = model.add
+    new_bool_var = model.new_bool_var
+    new_int_var = model.new_int_var
     assumption_records: Optional[Dict[int, Dict[str, Any]]] = {} if diagnose_unsat else None
 
     def add_labeled_constraint(expr, category: Optional[str] = None, **meta: Any):
-        ct = model.add(expr)
+        ct = add(expr)
         if assumption_records is not None and category:
-            a = model.new_bool_var(f"assume_{len(assumption_records)}_{category}")
+            a = new_bool_var(f"assume_{len(assumption_records)}_{category}")
             ct.only_enforce_if(a)
             model.add_assumption(a)
             payload = {"category": category}
@@ -780,9 +785,10 @@ def build_model(
     x = {}  # (group_id, bundle_id, slot_id) -> BoolVar
     teacher_choice = {}  # (group_id, bundle_id, slot_id, teacher_id) -> BoolVar
     occ = {}  # (group_id, slot_id) -> BoolVar
-    gap_vars = []
     objective_terms = []
-    assignment_var_meta: Dict[int, Tuple[int, int, int]] = {}
+    assignment_var_meta: Optional[Dict[int, Tuple[int, int, int]]] = (
+        {} if diagnose_unsat else None
+    )
 
     teacher_time_map: Dict[Tuple[int, int, int], List] = collections.defaultdict(list)
     busy_slots = set()
@@ -817,35 +823,39 @@ def build_model(
             for subject_id in bundle.subject_ids:
                 subject_to_bundles[subject_id].append(bundle.id)
 
+        bundle_teacher_ids = {bundle.id: tuple(bundle.teacher_ids) for bundle in bundles}
+
         for bundle in bundles:
+            teacher_ids = bundle_teacher_ids[bundle.id]
             for slot in slots:
-                var = model.new_bool_var(f"x_g{gid}_b{bundle.id}_s{slot.id}")
+                var = new_bool_var(f"x_g{gid}_b{bundle.id}_s{slot.id}")
                 x[(gid, bundle.id, slot.id)] = var
                 slot_to_xs[slot.id].append(var)
 
-                teacher_ids = sorted(set(bundle.teacher_ids))
                 if len(teacher_ids) == 1:
                     teacher_id = teacher_ids[0]
-                    assignment_var_meta[var.Index()] = (gid, bundle.id, slot.id)
+                    if assignment_var_meta is not None:
+                        assignment_var_meta[var.Index()] = (gid, bundle.id, slot.id)
                     teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(var)
                 elif len(teacher_ids) > 1:
                     choice_vars = []
                     for teacher_id in teacher_ids:
-                        tvar = model.new_bool_var(
+                        tvar = new_bool_var(
                             f"teach_g{gid}_b{bundle.id}_s{slot.id}_t{teacher_id}"
                         )
                         teacher_choice[(gid, bundle.id, slot.id, teacher_id)] = tvar
                         choice_vars.append(tvar)
-                        assignment_var_meta[tvar.Index()] = (gid, bundle.id, slot.id)
+                        if assignment_var_meta is not None:
+                            assignment_var_meta[tvar.Index()] = (gid, bundle.id, slot.id)
                         teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(tvar)
-                        model.add(tvar <= var)
-                    model.add(sum(choice_vars) == var)
+                        add(tvar <= var)
+                    add(sum(choice_vars) == var)
 
         for slot in slots:
-            occ_var = model.new_bool_var(f"occ_g{gid}_s{slot.id}")
+            occ_var = new_bool_var(f"occ_g{gid}_s{slot.id}")
             occ[(gid, slot.id)] = occ_var
             # At most one bundle per slot; occ captures if anything scheduled.
-            model.add(sum(slot_to_xs[slot.id]) == occ_var)
+            add(sum(slot_to_xs[slot.id]) == occ_var)
 
             # Objective: earlier slots are preferred.
             if early_weight:
@@ -869,8 +879,8 @@ def build_model(
                 f"Unknown subject_spread_strategy: {subject_spread_strategy}. "
                 "Use 'off', 'soft', 'hard', or 'both'."
             )
-        spread_soft = spread_strategy in {"soft", "both"}
-        spread_hard = spread_strategy in {"hard", "both"}
+        spread_soft_active = spread_strategy in {"soft", "both"} and subject_spread_weight > 0
+        spread_hard_active = spread_strategy in {"hard", "both"}
 
         allow_unassigned = strategy == "unassigned" and required_lessons > capacity
         trimmed_counts: Dict[int, int] = {b.id: b.lesson_count for b in bundles}
@@ -916,7 +926,7 @@ def build_model(
                 )
 
         # Subject distribution constraints/penalties within a day.
-        if spread_soft or spread_hard:
+        if spread_soft_active or spread_hard_active:
             num_days = max(1, len(day_slots))
             subject_target_counts = {
                 subject_id: sum(trimmed_counts[b_id] for b_id in bundle_ids)
@@ -933,23 +943,33 @@ def build_model(
 
                 for day_index, slot_ids in enumerate(day_slots):
                     # Build subject occurrence vars/exprs for this day.
-                    occ_vars = []
-                    occ_exprs = []
+                    occ_vars = [] if spread_soft_active else None
+                    occ_exprs = [] if spread_hard_active else None
                     for sid in slot_ids:
-                        vars_for_slot = [x[(gid, b_id, sid)] for b_id in bundle_ids]
-                        if spread_soft:
+                        if spread_soft_active and spread_hard_active:
+                            vars_for_slot = [x[(gid, b_id, sid)] for b_id in bundle_ids]
+                        elif spread_soft_active:
+                            vars_for_slot = [x[(gid, b_id, sid)] for b_id in bundle_ids]
+                        else:
+                            vars_for_slot = None
+
+                        if spread_soft_active and occ_vars is not None:
+                            assert vars_for_slot is not None
                             if len(vars_for_slot) == 1:
                                 occ_var = vars_for_slot[0]
                             else:
-                                occ_var = model.new_bool_var(
+                                occ_var = new_bool_var(
                                     f"subj_g{gid}_s{subject_id}_slot{sid}"
                                 )
-                                model.add(sum(vars_for_slot) == occ_var)
+                                add(sum(vars_for_slot) == occ_var)
                             occ_vars.append(occ_var)
-                        if spread_hard:
-                            occ_exprs.append(sum(vars_for_slot))
+                        if spread_hard_active and occ_exprs is not None:
+                            if vars_for_slot is None:
+                                occ_exprs.append(sum(x[(gid, b_id, sid)] for b_id in bundle_ids))
+                            else:
+                                occ_exprs.append(sum(vars_for_slot))
 
-                    if spread_hard and occ_exprs:
+                    if spread_hard_active and occ_exprs:
                         weekday_id = slots[slot_ids[0]].weekday_id if slot_ids else None
                         add_labeled_constraint(
                             sum(occ_exprs) <= max_per_day_subject,
@@ -961,20 +981,19 @@ def build_model(
                             max_per_day_subject=int(max_per_day_subject),
                         )
 
-                    if spread_soft and len(occ_vars) >= 2:
+                    if spread_soft_active and occ_vars is not None and len(occ_vars) >= 2:
                         day_len = len(occ_vars)
                         for i in range(day_len - 1):
                             for j in range(i + 1, day_len):
                                 dist = j - i
                                 weight = (day_len - dist)
-                                both = model.new_bool_var(
+                                both = new_bool_var(
                                     f"subj_pair_g{gid}_s{subject_id}_d{day_index}_{i}_{j}"
                                 )
-                                model.add(both <= occ_vars[i])
-                                model.add(both <= occ_vars[j])
-                                model.add(both >= occ_vars[i] + occ_vars[j] - 1)
-                                if subject_spread_weight:
-                                    objective_terms.append(subject_spread_weight * weight * both)
+                                add(both <= occ_vars[i])
+                                add(both <= occ_vars[j])
+                                add(both >= occ_vars[i] + occ_vars[j] - 1)
+                                objective_terms.append(subject_spread_weight * weight * both)
 
         # Max lessons per day.
         for slot_ids in day_slots:
@@ -997,8 +1016,8 @@ def build_model(
                 if not slot_ids:
                     continue
                 day_load_ub = min(max_per_day, len(slot_ids))
-                day_load = model.new_int_var(0, day_load_ub, f"day_load_g{gid}_d{day_index}")
-                model.add(day_load == sum(occ[(gid, sid)] for sid in slot_ids))
+                day_load = new_int_var(0, day_load_ub, f"day_load_g{gid}_d{day_index}")
+                add(day_load == sum(occ[(gid, sid)] for sid in slot_ids))
                 daily_loads.append((day_load, day_load_ub))
 
             if len(daily_loads) >= 2:
@@ -1006,7 +1025,7 @@ def build_model(
                     day_load_i, ub_i = daily_loads[i]
                     for j in range(i + 1, len(daily_loads)):
                         day_load_j, ub_j = daily_loads[j]
-                        diff = model.new_int_var(
+                        diff = new_int_var(
                             0,
                             max(ub_i, ub_j),
                             f"day_load_diff_g{gid}_{i}_{j}",
@@ -1020,72 +1039,77 @@ def build_model(
                 n = len(slot_ids)
                 if n <= 2:
                     continue
-                before = [model.new_bool_var(f"before_g{gid}_d{slot_ids[0]}_{i}") for i in range(n)]
-                after = [model.new_bool_var(f"after_g{gid}_d{slot_ids[0]}_{i}") for i in range(n)]
-                gaps = [model.new_bool_var(f"gap_g{gid}_d{slot_ids[0]}_{i}") for i in range(n)]
+                before = [new_bool_var(f"before_g{gid}_d{slot_ids[0]}_{i}") for i in range(n)]
+                after = [new_bool_var(f"after_g{gid}_d{slot_ids[0]}_{i}") for i in range(n)]
+                gaps = [new_bool_var(f"gap_g{gid}_d{slot_ids[0]}_{i}") for i in range(n)]
 
-                model.add(before[0] == 0)
+                add(before[0] == 0)
                 for i in range(1, n):
                     prev_occ = occ[(gid, slot_ids[i - 1])]
-                    model.add(before[i] >= before[i - 1])
-                    model.add(before[i] >= prev_occ)
-                    model.add(before[i] <= before[i - 1] + prev_occ)
+                    add(before[i] >= before[i - 1])
+                    add(before[i] >= prev_occ)
+                    add(before[i] <= before[i - 1] + prev_occ)
 
-                model.add(after[n - 1] == 0)
+                add(after[n - 1] == 0)
                 for i in range(n - 2, -1, -1):
                     next_occ = occ[(gid, slot_ids[i + 1])]
-                    model.add(after[i] >= after[i + 1])
-                    model.add(after[i] >= next_occ)
-                    model.add(after[i] <= after[i + 1] + next_occ)
+                    add(after[i] >= after[i + 1])
+                    add(after[i] >= next_occ)
+                    add(after[i] <= after[i + 1] + next_occ)
 
                 for i in range(n):
                     occ_i = occ[(gid, slot_ids[i])]
                     gap = gaps[i]
-                    model.add(gap <= before[i])
-                    model.add(gap <= after[i])
-                    model.add(gap <= 1 - occ_i)
-                    model.add(gap >= before[i] + after[i] + 1 - occ_i - 2)
-                    gap_vars.append(gap)
+                    add(gap <= before[i])
+                    add(gap <= after[i])
+                    add(gap <= 1 - occ_i)
+                    add(gap >= before[i] + after[i] + 1 - occ_i - 2)
                     objective_terms.append(gap_weight * gap)
 
     # Teacher conflict constraints across all groups.
     for (teacher_id, weekday_id, lesson_time_id), vars_for_slot in teacher_time_map.items():
         if len(vars_for_slot) > 1:
-            involved_groups = sorted({
-                assignment_var_meta[v.Index()][0]
-                for v in vars_for_slot
-                if v.Index() in assignment_var_meta
-            })
-            add_labeled_constraint(
-                sum(vars_for_slot) <= 1,
-                category="teacher_time_conflict",
-                teacher_id=int(teacher_id),
-                weekday_id=int(weekday_id),
-                lesson_time_id=int(lesson_time_id),
-                competing_assignments=len(vars_for_slot),
-                involved_groups=involved_groups,
-                involved_group_count=len(involved_groups),
-            )
+            if assignment_var_meta is None:
+                add_labeled_constraint(sum(vars_for_slot) <= 1)
+            else:
+                involved_groups = sorted({
+                    assignment_var_meta[v.Index()][0]
+                    for v in vars_for_slot
+                    if v.Index() in assignment_var_meta
+                })
+                add_labeled_constraint(
+                    sum(vars_for_slot) <= 1,
+                    category="teacher_time_conflict",
+                    teacher_id=int(teacher_id),
+                    weekday_id=int(weekday_id),
+                    lesson_time_id=int(lesson_time_id),
+                    competing_assignments=len(vars_for_slot),
+                    involved_groups=involved_groups,
+                    involved_group_count=len(involved_groups),
+                )
 
     # Teacher availability constraints.
     for (teacher_id, weekday_id, lesson_time_id) in busy_slots:
         vars_for_slot = teacher_time_map.get((teacher_id, weekday_id, lesson_time_id))
         if vars_for_slot:
-            involved_groups = sorted({
-                assignment_var_meta[v.Index()][0]
-                for v in vars_for_slot
-                if v.Index() in assignment_var_meta
-            })
-            add_labeled_constraint(
-                sum(vars_for_slot) == 0,
-                category="teacher_busy_block",
-                teacher_id=int(teacher_id),
-                weekday_id=int(weekday_id),
-                lesson_time_id=int(lesson_time_id),
-                conflicting_assignments=len(vars_for_slot),
-                involved_groups=involved_groups,
-                involved_group_count=len(involved_groups),
-            )
+            if assignment_var_meta is None:
+                add_labeled_constraint(sum(vars_for_slot) == 0)
+            else:
+                involved_groups = sorted({
+                    assignment_var_meta[v.Index()][0]
+                    for v in vars_for_slot
+                    if v.Index() in assignment_var_meta
+                })
+                add_labeled_constraint(
+                    sum(vars_for_slot) == 0,
+                    category="teacher_busy_block",
+                    teacher_id=int(teacher_id),
+                    weekday_id=int(weekday_id),
+                    lesson_time_id=int(lesson_time_id),
+                    conflicting_assignments=len(vars_for_slot),
+                    involved_groups=involved_groups,
+                    involved_group_count=len(involved_groups),
+                )
 
     if objective_terms:
         model.minimize(sum(objective_terms))
@@ -1093,58 +1117,91 @@ def build_model(
     return model, x, teacher_choice, occ, group_info, assumption_records
 
 
-def solve(
-    time_limit: int = 60,
-    gap_weight: int = 10,
-    early_weight: int = 1,
-    daily_balance_weight: int = 5,
-    unassigned_weight: int = 1000,
-    over_capacity_strategy: str = "unassigned",
-    subject_spread_strategy: str = "soft",
-    subject_spread_weight: int = 5,
-    ignore_availability: bool = False,
-    diagnose_unsat: bool = False,
-    unsat_core_max_items: int = 20,
-    log: bool = False,
-):
-    teacher_sum_validation = validate_teacher_week_count_sum_consistency(data)
-    if teacher_sum_validation.get("mismatch_count", 0) > 0:
-        raise DataValidationError(
-            format_teacher_week_count_sum_validation_error(teacher_sum_validation)
+def resolve_solver_parameter_overrides(
+    solver_profile: str = "default",
+    num_search_workers: Optional[int] = None,
+    symmetry_level: Optional[int] = None,
+    cp_model_presolve: str = "auto",
+    random_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    if solver_profile not in SOLVER_PROFILE_CHOICES:
+        raise ValueError(
+            f"Unknown solver_profile: {solver_profile}. "
+            f"Use one of {', '.join(SOLVER_PROFILE_CHOICES)}."
         )
+    if cp_model_presolve not in CP_MODEL_PRESOLVE_CHOICES:
+        raise ValueError(
+            f"Unknown cp_model_presolve: {cp_model_presolve}. "
+            f"Use one of {', '.join(CP_MODEL_PRESOLVE_CHOICES)}."
+        )
+    if num_search_workers is not None and num_search_workers <= 0:
+        raise ValueError("num_search_workers must be > 0")
 
-    model, x, teacher_choice, occ, group_info, assumption_records = build_model(
-        gap_weight=gap_weight,
-        early_weight=early_weight,
-        daily_balance_weight=daily_balance_weight,
-        unassigned_weight=unassigned_weight,
-        over_capacity_strategy=over_capacity_strategy,
-        subject_spread_strategy=subject_spread_strategy,
-        subject_spread_weight=subject_spread_weight,
-        ignore_availability=ignore_availability,
-        diagnose_unsat=diagnose_unsat,
-    )
-    report = analyze_infeasibility(
-        data,
-        over_capacity_strategy=over_capacity_strategy,
-        subject_spread_strategy=subject_spread_strategy,
-        ignore_availability=ignore_availability,
-    )
-    print_feasibility_report(report)
+    profile_defaults: Dict[str, Any] = {"num_search_workers": 8}
+    if solver_profile == "first-feasible":
+        profile_defaults = {
+            "num_search_workers": 4,
+            "symmetry_level": 0,
+            "cp_model_presolve": False,
+        }
 
-    solver = cp_model.CpSolver()
+    resolved: Dict[str, Any] = {}
+    resolved["num_search_workers"] = (
+        num_search_workers
+        if num_search_workers is not None
+        else profile_defaults.get("num_search_workers")
+    )
+    if symmetry_level is not None:
+        resolved["symmetry_level"] = symmetry_level
+    elif "symmetry_level" in profile_defaults:
+        resolved["symmetry_level"] = profile_defaults["symmetry_level"]
+
+    if cp_model_presolve == "on":
+        resolved["cp_model_presolve"] = True
+    elif cp_model_presolve == "off":
+        resolved["cp_model_presolve"] = False
+    elif "cp_model_presolve" in profile_defaults:
+        resolved["cp_model_presolve"] = profile_defaults["cp_model_presolve"]
+
+    if random_seed is not None:
+        resolved["random_seed"] = random_seed
+
+    return resolved
+
+
+def configure_solver(
+    solver: cp_model.CpSolver,
+    *,
+    time_limit: int,
+    log: bool = False,
+    solver_profile: str = "default",
+    num_search_workers: Optional[int] = None,
+    symmetry_level: Optional[int] = None,
+    cp_model_presolve: str = "auto",
+    random_seed: Optional[int] = None,
+) -> Dict[str, Any]:
     solver.parameters.max_time_in_seconds = time_limit
-    solver.parameters.num_search_workers = 16
     if log:
         solver.parameters.log_search_progress = True
 
-    status = solver.Solve(model)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        if status == cp_model.INFEASIBLE and diagnose_unsat and assumption_records:
-            core_report = build_unsat_core_report(solver, assumption_records)
-            print_unsat_core_report(core_report, max_items=unsat_core_max_items)
-        return None, status, None
+    resolved = resolve_solver_parameter_overrides(
+        solver_profile=solver_profile,
+        num_search_workers=num_search_workers,
+        symmetry_level=symmetry_level,
+        cp_model_presolve=cp_model_presolve,
+        random_seed=random_seed,
+    )
+    for key, value in resolved.items():
+        setattr(solver.parameters, key, value)
+    return resolved
 
+
+def extract_schedule_from_solution(
+    solver: cp_model.CpSolver,
+    x: Dict[Tuple[int, int, int], Any],
+    teacher_choice: Dict[Tuple[int, int, int, int], Any],
+    group_info: Dict[int, Dict[str, Any]],
+) -> dict:
     schedule = {"groups": {}}
     for gid, info in group_info.items():
         slots = info["slots"]
@@ -1211,12 +1268,115 @@ def solve(
 
         schedule["groups"][str(gid)] = group_entry
 
+    return schedule
+
+
+def solve(
+    time_limit: int = 60,
+    gap_weight: int = 10,
+    early_weight: int = 1,
+    daily_balance_weight: int = 5,
+    unassigned_weight: int = 1000,
+    over_capacity_strategy: str = "unassigned",
+    subject_spread_strategy: str = "soft",
+    subject_spread_weight: int = 5,
+    ignore_availability: bool = False,
+    diagnose_unsat: bool = False,
+    unsat_core_max_items: int = 20,
+    log: bool = False,
+    solver_profile: str = "default",
+    num_search_workers: Optional[int] = None,
+    symmetry_level: Optional[int] = None,
+    cp_model_presolve: str = "auto",
+    random_seed: Optional[int] = None,
+):
+    teacher_sum_validation = validate_teacher_week_count_sum_consistency(data)
+    if teacher_sum_validation.get("mismatch_count", 0) > 0:
+        raise DataValidationError(
+            format_teacher_week_count_sum_validation_error(teacher_sum_validation)
+        )
+
+    model, x, teacher_choice, occ, group_info, assumption_records = build_model(
+        gap_weight=gap_weight,
+        early_weight=early_weight,
+        daily_balance_weight=daily_balance_weight,
+        unassigned_weight=unassigned_weight,
+        over_capacity_strategy=over_capacity_strategy,
+        subject_spread_strategy=subject_spread_strategy,
+        subject_spread_weight=subject_spread_weight,
+        ignore_availability=ignore_availability,
+        diagnose_unsat=diagnose_unsat,
+    )
+    report = analyze_infeasibility(
+        data,
+        over_capacity_strategy=over_capacity_strategy,
+        subject_spread_strategy=subject_spread_strategy,
+        ignore_availability=ignore_availability,
+    )
+    print_feasibility_report(report)
+
+    solver = cp_model.CpSolver()
+    configure_solver(
+        solver,
+        time_limit=time_limit,
+        log=log,
+        solver_profile=solver_profile,
+        num_search_workers=num_search_workers,
+        symmetry_level=symmetry_level,
+        cp_model_presolve=cp_model_presolve,
+        random_seed=random_seed,
+    )
+
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if status == cp_model.INFEASIBLE and diagnose_unsat and assumption_records:
+            core_report = build_unsat_core_report(solver, assumption_records)
+            print_unsat_core_report(core_report, max_items=unsat_core_max_items)
+        return None, status, None
+
+    schedule = extract_schedule_from_solution(solver, x, teacher_choice, group_info)
     return schedule, status, solver.ObjectiveValue()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate timetable with OR-Tools CP-SAT")
     parser.add_argument("--time-limit", type=int, default=60, help="Max solve time in seconds")
+    parser.add_argument(
+        "--solver-profile",
+        choices=SOLVER_PROFILE_CHOICES,
+        default="default",
+        help=(
+            "Solver parameter profile. "
+            "'default' keeps current behavior; 'first-feasible' favors getting a solution sooner."
+        ),
+    )
+    parser.add_argument(
+        "--num-search-workers",
+        type=int,
+        default=None,
+        help="Override CP-SAT num_search_workers (default profile uses 8).",
+    )
+    parser.add_argument(
+        "--symmetry-level",
+        type=int,
+        default=None,
+        help="Override CP-SAT symmetry_level (unset = use profile/default behavior).",
+    )
+    parser.add_argument(
+        "--cp-model-presolve",
+        choices=CP_MODEL_PRESOLVE_CHOICES,
+        default="auto",
+        help=(
+            "Control CP-SAT cp_model_presolve. "
+            "'auto' keeps profile/default behavior, 'on' forces True, 'off' forces False."
+        ),
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Set CP-SAT random_seed (useful for repeatable benchmarking).",
+    )
     parser.add_argument(
         "--gap-weight",
         type=int,
@@ -1330,6 +1490,11 @@ def main():
             diagnose_unsat=args.diagnose_unsat,
             unsat_core_max_items=args.unsat_core_max_items,
             log=args.log,
+            solver_profile=args.solver_profile,
+            num_search_workers=args.num_search_workers,
+            symmetry_level=args.symmetry_level,
+            cp_model_presolve=args.cp_model_presolve,
+            random_seed=args.random_seed,
         )
     except DataValidationError as exc:
         print(str(exc), file=sys.stderr)
