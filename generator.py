@@ -783,7 +783,6 @@ def build_model(
 
     # Storage
     x = {}  # (group_id, bundle_id, slot_id) -> BoolVar
-    teacher_choice = {}  # (group_id, bundle_id, slot_id, teacher_id) -> BoolVar
     occ = {}  # (group_id, slot_id) -> BoolVar
     objective_terms = []
     assignment_var_meta: Optional[Dict[int, Tuple[int, int, int]]] = (
@@ -823,33 +822,17 @@ def build_model(
             for subject_id in bundle.subject_ids:
                 subject_to_bundles[subject_id].append(bundle.id)
 
-        bundle_teacher_ids = {bundle.id: tuple(bundle.teacher_ids) for bundle in bundles}
-
         for bundle in bundles:
-            teacher_ids = bundle_teacher_ids[bundle.id]
+            teacher_ids = tuple(bundle.teacher_ids)
             for slot in slots:
                 var = new_bool_var(f"x_g{gid}_b{bundle.id}_s{slot.id}")
                 x[(gid, bundle.id, slot.id)] = var
                 slot_to_xs[slot.id].append(var)
 
-                if len(teacher_ids) == 1:
-                    teacher_id = teacher_ids[0]
-                    if assignment_var_meta is not None:
-                        assignment_var_meta[var.Index()] = (gid, bundle.id, slot.id)
+                if assignment_var_meta is not None:
+                    assignment_var_meta[var.Index()] = (gid, bundle.id, slot.id)
+                for teacher_id in teacher_ids:
                     teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(var)
-                elif len(teacher_ids) > 1:
-                    choice_vars = []
-                    for teacher_id in teacher_ids:
-                        tvar = new_bool_var(
-                            f"teach_g{gid}_b{bundle.id}_s{slot.id}_t{teacher_id}"
-                        )
-                        teacher_choice[(gid, bundle.id, slot.id, teacher_id)] = tvar
-                        choice_vars.append(tvar)
-                        if assignment_var_meta is not None:
-                            assignment_var_meta[tvar.Index()] = (gid, bundle.id, slot.id)
-                        teacher_time_map[(teacher_id, slot.weekday_id, slot.lesson_time_id)].append(tvar)
-                        add(tvar <= var)
-                    add(sum(choice_vars) == var)
 
         for slot in slots:
             occ_var = new_bool_var(f"occ_g{gid}_s{slot.id}")
@@ -1114,7 +1097,7 @@ def build_model(
     if objective_terms:
         model.minimize(sum(objective_terms))
 
-    return model, x, teacher_choice, occ, group_info, assumption_records
+    return model, x, occ, group_info, assumption_records
 
 
 def resolve_solver_parameter_overrides(
@@ -1199,7 +1182,6 @@ def configure_solver(
 def extract_schedule_from_solution(
     solver: cp_model.CpSolver,
     x: Dict[Tuple[int, int, int], Any],
-    teacher_choice: Dict[Tuple[int, int, int, int], Any],
     group_info: Dict[int, Dict[str, Any]],
 ) -> dict:
     schedule = {"groups": {}}
@@ -1239,16 +1221,7 @@ def extract_schedule_from_solution(
                 else:
                     b = bundle_by_id[b_id]
                     curriculum_ids = b.curriculum_ids
-                    if len(b.teacher_ids) <= 1:
-                        teacher_ids = b.teacher_ids
-                    else:
-                        teacher_ids = [
-                            tid
-                            for tid in b.teacher_ids
-                            if solver.Value(teacher_choice[(gid, b_id, sid, tid)])
-                        ]
-                        if not teacher_ids:
-                            teacher_ids = b.teacher_ids
+                    teacher_ids = b.teacher_ids
                     subject_ids = b.subject_ids
                 entries.append(
                     {
@@ -1296,7 +1269,7 @@ def solve(
             format_teacher_week_count_sum_validation_error(teacher_sum_validation)
         )
 
-    model, x, teacher_choice, occ, group_info, assumption_records = build_model(
+    model, x, occ, group_info, assumption_records = build_model(
         gap_weight=gap_weight,
         early_weight=early_weight,
         daily_balance_weight=daily_balance_weight,
@@ -1334,7 +1307,7 @@ def solve(
             print_unsat_core_report(core_report, max_items=unsat_core_max_items)
         return None, status, None
 
-    schedule = extract_schedule_from_solution(solver, x, teacher_choice, group_info)
+    schedule = extract_schedule_from_solution(solver, x, group_info)
     return schedule, status, solver.ObjectiveValue()
 
 
