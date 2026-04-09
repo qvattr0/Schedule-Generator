@@ -2,13 +2,22 @@ import argparse
 import collections
 import json
 import sys
+import time
 import webbrowser
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from ortools.sat.python import cp_model
-from mock_data import data as data
-from render_schedule import render_schedule
+
+try:
+    from mock_data import data as data
+except ImportError:
+    data = None
+
+try:
+    from render_schedule import render_schedule
+except ImportError:
+    render_schedule = None
 
 try:
     import tomllib
@@ -791,6 +800,8 @@ def build_model(
 
     teacher_time_map: Dict[Tuple[int, int, int], List] = collections.defaultdict(list)
     busy_slots = set()
+    if data is None:
+        raise RuntimeError("No input data loaded. When running inside the service, use solve_to_rows() instead.")
     if not ignore_availability and data["teachers_busy"] is not None:
         for entry in data.get("teachers_busy", []):
             teacher_id = entry.get("teacher_id", entry.get("staff_id"))
@@ -939,7 +950,7 @@ def build_model(
                         if spread_soft_active and occ_vars is not None:
                             assert vars_for_slot is not None
                             if len(vars_for_slot) == 1:
-                                occ_var = vars_for_slot[0]
+                                    occ_var = vars_for_slot[0]
                             else:
                                 occ_var = new_bool_var(
                                     f"subj_g{gid}_s{subject_id}_slot{sid}"
@@ -1263,6 +1274,8 @@ def solve(
     cp_model_presolve: str = "auto",
     random_seed: Optional[int] = None,
 ):
+    if data is None:
+        raise RuntimeError("No input data loaded. When running inside the service, use solve_to_rows() instead.")
     teacher_sum_validation = validate_teacher_week_count_sum_consistency(data)
     if teacher_sum_validation.get("mismatch_count", 0) > 0:
         raise DataValidationError(
@@ -1309,6 +1322,233 @@ def solve(
 
     schedule = extract_schedule_from_solution(solver, x, group_info)
     return schedule, status, solver.ObjectiveValue()
+
+
+def _adapt_infeasibility_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert analyze_infeasibility() output to the flat format expected by
+    the service router and humanize_infeasible_report()."""
+    if not report or not isinstance(report, dict):
+        return {"primary_cause": None, "reasons": [], "top_reasons": []}
+
+    primary = report.get("primary_cause")
+    primary_str = None
+    if isinstance(primary, dict):
+        primary_str = primary.get("reason")
+    elif isinstance(primary, str):
+        primary_str = primary
+
+    reasons: List[Dict[str, Any]] = []
+
+    for g in (report.get("groups") or []):
+        gid = g.get("group_id")
+        for reason_str in (g.get("reasons") or []):
+            reasons.append({
+                "reason": reason_str,
+                "group_id": gid,
+                "required": g.get("required_lessons"),
+                "capacity": g.get("capacity"),
+                "max_per_day": g.get("max_per_day"),
+            })
+        for tc in (g.get("teacher_checks") or []):
+            for reason_str in (tc.get("reasons") or []):
+                reasons.append({
+                    "reason": reason_str,
+                    "group_id": gid,
+                    "teacher_id": tc.get("teacher_id"),
+                    "need": tc.get("need_lessons_in_group"),
+                    "available": tc.get("available_times_in_group"),
+                    "blocked": tc.get("blocked_busy_times_in_group"),
+                    "cap_week": tc.get("teacher_week_cap"),
+                })
+
+    for tc in (report.get("teacher_global_checks") or []):
+        for reason_str in (tc.get("reasons") or []):
+            reasons.append({
+                "reason": reason_str,
+                "teacher_id": tc.get("teacher_id"),
+                "required": tc.get("need_total_lessons"),
+                "cap": tc.get("teacher_week_cap"),
+                "available_week_times": tc.get("available_week_times"),
+                "available_group_times": tc.get("available_group_times"),
+            })
+
+    return {
+        "primary_cause": primary_str,
+        "reasons": reasons[:400],
+        "top_reasons": report.get("top_reasons") or [],
+    }
+
+
+def solve_to_rows(
+    input_data: dict,
+    *,
+    time_limit: int = 60,
+    gap_weight: int = 10,
+    early_weight: int = 1,
+    unassigned_weight: int = 1000,
+    over_capacity_strategy: str = "unassigned",
+    subject_spread_strategy: str = "soft",
+    subject_spread_weight: int = 5,
+    log: bool = False,
+) -> Tuple[Optional[List[dict]], int, Optional[float], Dict[str, Any]]:
+    """Service-compatible entry point.
+
+    Accepts ``input_data`` as a parameter (instead of the module-global
+    ``data``), returns flat row dicts and a meta dict — matching the
+    contract defined in solver_contract.py / AGENTS.md.
+    """
+    t0 = time.time()
+
+    global data
+    _prev_data = data
+    data = input_data
+    try:
+        # --- validation ------------------------------------------------
+        teacher_val = validate_teacher_week_count_sum_consistency(input_data)
+        if teacher_val.get("mismatch_count", 0) > 0:
+            msg = format_teacher_week_count_sum_validation_error(teacher_val)
+            reason_counts = collections.Counter(
+                m.get("reason", "UNKNOWN")
+                for m in (teacher_val.get("mismatches") or [])
+            )
+            meta: Dict[str, Any] = {
+                "validation_error": teacher_val,
+                "validation_message": msg,
+                "infeasible_report": {
+                    "primary_cause": "INPUT_VALIDATION_TEACHER_WEEK_COUNT_SUM_MISMATCH",
+                    "reasons": [
+                        {
+                            "reason": "INPUT_VALIDATION_TEACHER_WEEK_COUNT_SUM_MISMATCH",
+                            "teacher_id": m.get("teacher_id"),
+                            "teacher_name": m.get("teacher_name"),
+                            "declared_lesson_week_count_sum": m.get("declared_lesson_week_count_sum"),
+                            "aggregated_lessom_week_count": m.get("aggregated_lessom_week_count"),
+                            "validation_reason": m.get("reason"),
+                        }
+                        for m in (teacher_val.get("mismatches") or [])
+                    ][:400],
+                    "top_reasons": [
+                        {"reason": k, "count": int(v)}
+                        for k, v in reason_counts.most_common(10)
+                    ],
+                },
+                "build_solve_seconds": round(time.time() - t0, 3),
+            }
+            return None, int(cp_model.MODEL_INVALID), None, meta
+
+        # --- infeasibility pre-check -----------------------------------
+        raw_report = analyze_infeasibility(
+            input_data,
+            over_capacity_strategy=over_capacity_strategy,
+            subject_spread_strategy=subject_spread_strategy,
+        )
+        infeasible_report = _adapt_infeasibility_report(raw_report)
+
+        # --- build & solve ---------------------------------------------
+        model, x, occ, group_info, _ = build_model(
+            gap_weight=gap_weight,
+            early_weight=early_weight,
+            unassigned_weight=unassigned_weight,
+            over_capacity_strategy=over_capacity_strategy,
+            subject_spread_strategy=subject_spread_strategy,
+            subject_spread_weight=subject_spread_weight,
+        )
+
+        solver = cp_model.CpSolver()
+        configure_solver(solver, time_limit=time_limit, log=log)
+        status = solver.Solve(model)
+
+        obj = None
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            obj = float(solver.ObjectiveValue())
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            meta = {
+                "infeasible_report": infeasible_report,
+                "build_solve_seconds": round(time.time() - t0, 3),
+            }
+            return None, status, None, meta
+
+        # --- extract flat rows -----------------------------------------
+        rows: List[dict] = []
+        filled_slots = 0
+
+        for gid, info in group_info.items():
+            slots: List[Slot] = info["slots"]
+            bundles: List[Bundle] = info["bundles"]
+            day_slots: List[List[int]] = info["day_slots"]
+            c_to_b: Dict[int, int] = info["curriculum_to_bundle"]
+
+            bundle_items: Dict[int, List[dict]] = collections.defaultdict(list)
+            for cd in (info["group"].get("curriculum_data") or []):
+                cid = cd.get("curriculum_id")
+                if cid is not None and cid in c_to_b:
+                    bundle_items[c_to_b[cid]].append(cd)
+
+            bundle_by_id = {b.id: b for b in bundles}
+
+            slot_bundle: Dict[int, Optional[int]] = {}
+            for slot in slots:
+                assigned = None
+                for b in bundles:
+                    if solver.Value(x[(gid, b.id, slot.id)]):
+                        assigned = b.id
+                        break
+                slot_bundle[slot.id] = assigned
+
+            for slot_ids in day_slots:
+                for sid in slot_ids:
+                    b_id = slot_bundle.get(sid)
+                    if b_id is None:
+                        continue
+
+                    slot = slots[sid]
+                    filled_slots += 1
+                    items = bundle_items.get(b_id, [])
+
+                    if items:
+                        for cd in items:
+                            rows.append({
+                                "group_id": gid,
+                                "weekday_id": slot.weekday_id,
+                                "lesson_time_id": slot.lesson_time_id,
+                                "start_time": slot.start_time,
+                                "end_time": slot.end_time,
+                                "subject_id": cd.get("subject_id"),
+                                "teacher_id": cd.get("teacher_id"),
+                                "curriculum_id": cd.get("curriculum_id"),
+                                "subgroup_id": cd.get("subgroup_id"),
+                                "cabinet_id": cd.get("cabinet_id"),
+                            })
+                    else:
+                        b = bundle_by_id[b_id]
+                        for ci, cid in enumerate(b.curriculum_ids):
+                            rows.append({
+                                "group_id": gid,
+                                "weekday_id": slot.weekday_id,
+                                "lesson_time_id": slot.lesson_time_id,
+                                "start_time": slot.start_time,
+                                "end_time": slot.end_time,
+                                "subject_id": b.subject_ids[min(ci, len(b.subject_ids) - 1)] if b.subject_ids else None,
+                                "teacher_id": b.teacher_ids[min(ci, len(b.teacher_ids) - 1)] if b.teacher_ids else None,
+                                "curriculum_id": cid,
+                                "subgroup_id": None,
+                                "cabinet_id": None,
+                            })
+
+        meta = {
+            "groups_count": len(group_info),
+            "filled_slots": filled_slots,
+            "rows_count": len(rows),
+            "objective": obj,
+            "build_solve_seconds": round(time.time() - t0, 3),
+            "infeasible_report": infeasible_report,
+        }
+
+        return rows, status, obj, meta
+
+    finally:
+        data = _prev_data
 
 
 def main():
@@ -1487,6 +1727,9 @@ def main():
     print(f"Wrote schedule to {args.output}")
 
     if args.render:
+        if render_schedule is None:
+            print("render_schedule is not available (missing render_schedule module).", file=sys.stderr)
+            sys.exit(2)
         html = render_schedule(schedule, group_id=args.render_group)
         with open(args.render, "w") as f:
             f.write(html)
