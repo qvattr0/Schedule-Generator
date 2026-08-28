@@ -6,7 +6,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from ortools.sat.python import cp_model
 
@@ -29,9 +29,9 @@ except ModuleNotFoundError:  # pragma: no cover - depends on Python version
 @dataclass(frozen=True)
 class Bundle:
     id: int
-    curriculum_ids: List[int]
-    teacher_ids: List[int]
-    subject_ids: List[int]
+    curriculum_ids: list[int]
+    teacher_ids: list[int]
+    subject_ids: list[int]
     lesson_count: int
 
 
@@ -55,7 +55,7 @@ class ObjectiveWeightConfigError(RuntimeError):
     pass
 
 
-OBJECTIVE_WEIGHT_DEFAULTS: Dict[str, int] = {
+OBJECTIVE_WEIGHT_DEFAULTS: dict[str, int] = {
     "gap_weight": 10,
     "early_weight": 1,
     "daily_balance_weight": 5,
@@ -67,7 +67,7 @@ SOLVER_PROFILE_CHOICES = ("default", "first-feasible")
 CP_MODEL_PRESOLVE_CHOICES = ("auto", "on", "off")
 
 
-def load_objective_weight_config(config_path: Path = OBJECTIVE_WEIGHTS_CONFIG_PATH) -> Dict[str, int]:
+def load_objective_weight_config(config_path: Path = OBJECTIVE_WEIGHTS_CONFIG_PATH) -> dict[str, int]:
     if not config_path.exists():
         return {}
 
@@ -96,7 +96,7 @@ def load_objective_weight_config(config_path: Path = OBJECTIVE_WEIGHTS_CONFIG_PA
             f"Objective weights config {config_path} must contain a TOML table."
         )
 
-    resolved: Dict[str, int] = {}
+    resolved: dict[str, int] = {}
     for key in OBJECTIVE_WEIGHT_DEFAULTS:
         if key not in payload:
             continue
@@ -121,7 +121,7 @@ def apply_objective_weight_precedence(args: argparse.Namespace) -> None:
             setattr(args, key, config_weights.get(key, default_value))
 
 
-def _build_bundles(curriculum_data: List[dict]) -> Tuple[List[Bundle], Dict[int, int]]:
+def _build_bundles(curriculum_data: list[dict]) -> tuple[list[Bundle], dict[int, int]]:
     parent = {cd["curriculum_id"]: cd["curriculum_id"] for cd in curriculum_data}
 
     def find(x):
@@ -144,8 +144,8 @@ def _build_bundles(curriculum_data: List[dict]) -> Tuple[List[Bundle], Dict[int,
     for cd in curriculum_data:
         groups[find(cd["curriculum_id"])].append(cd)
 
-    bundles: List[Bundle] = []
-    curriculum_to_bundle: Dict[int, int] = {}
+    bundles: list[Bundle] = []
+    curriculum_to_bundle: dict[int, int] = {}
     for bundle_id, items in enumerate(groups.values()):
         lesson_count = items[0]["lessom_week_count"]
         teacher_ids = sorted({cd["teacher_id"] for cd in items})
@@ -166,11 +166,11 @@ def _build_bundles(curriculum_data: List[dict]) -> Tuple[List[Bundle], Dict[int,
     return bundles, curriculum_to_bundle
 
 
-def _build_slots(group: dict) -> Tuple[List[Slot], List[List[int]]]:
-    slots: List[Slot] = []
-    day_slots: List[List[int]] = []
+def _build_slots(group: dict) -> tuple[list[Slot], list[list[int]]]:
+    slots: list[Slot] = []
+    day_slots: list[list[int]] = []
     for day_index, ws in enumerate(group["weekday_slots"]):
-        slot_ids: List[int] = []
+        slot_ids: list[int] = []
         for pos, lt in enumerate(ws["lesson_times_slots"]):
             slot_id = len(slots)
             slots.append(
@@ -190,7 +190,7 @@ def _build_slots(group: dict) -> Tuple[List[Slot], List[List[int]]]:
     return slots, day_slots
 
 
-def _trim_bundle_counts(bundles: List[Bundle], capacity: int) -> Tuple[Dict[int, int], int]:
+def _trim_bundle_counts(bundles: list[Bundle], capacity: int) -> tuple[dict[int, int], int]:
     counts = {b.id: b.lesson_count for b in bundles}
     required = sum(counts.values())
     if required <= capacity:
@@ -212,10 +212,10 @@ def _trim_bundle_counts(bundles: List[Bundle], capacity: int) -> Tuple[Dict[int,
     return counts, trimmed
 
 
-def validate_teacher_week_count_sum_consistency(input_data: dict) -> Dict[str, Any]:
-    teacher_declared: Dict[int, int] = {}
-    teacher_names: Dict[int, str] = {}
-    teacher_declared_rows: Dict[int, List[int]] = collections.defaultdict(list)
+def validate_teacher_week_count_sum_consistency(input_data: dict) -> dict[str, Any]:
+    teacher_declared: dict[int, int] = {}
+    teacher_names: dict[int, str] = {}
+    teacher_declared_rows: dict[int, list[int]] = collections.defaultdict(list)
 
     for t in (input_data.get("curriculum_teachers") or []):
         tid = t.get("teacher_id")
@@ -235,10 +235,10 @@ def validate_teacher_week_count_sum_consistency(input_data: dict) -> Dict[str, A
         if tid not in teacher_declared:
             teacher_declared[tid] = declared
 
-    teacher_aggregated: Dict[int, int] = collections.defaultdict(int)
-    teacher_group_breakdown: Dict[int, Dict[int, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
-    teacher_group_names: Dict[int, Dict[int, str]] = collections.defaultdict(dict)
-    teacher_curriculum_rows: Dict[int, int] = collections.defaultdict(int)
+    teacher_aggregated: dict[int, int] = collections.defaultdict(int)
+    teacher_group_breakdown: dict[int, dict[int, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+    teacher_group_names: dict[int, dict[int, str]] = collections.defaultdict(dict)
+    teacher_curriculum_rows: dict[int, int] = collections.defaultdict(int)
 
     for group in (input_data.get("groups_curriculum") or []):
         gid = group.get("group_id")
@@ -258,7 +258,7 @@ def validate_teacher_week_count_sum_consistency(input_data: dict) -> Dict[str, A
             teacher_curriculum_rows[tid] += 1
 
     all_teacher_ids = sorted(set(teacher_declared.keys()) | set(teacher_aggregated.keys()))
-    mismatches: List[Dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
 
     for tid in all_teacher_ids:
         declared = teacher_declared.get(tid)
@@ -306,7 +306,7 @@ def validate_teacher_week_count_sum_consistency(input_data: dict) -> Dict[str, A
     }
 
 
-def format_teacher_week_count_sum_validation_error(report: Dict[str, Any]) -> str:
+def format_teacher_week_count_sum_validation_error(report: dict[str, Any]) -> str:
     mismatches = report.get("mismatches", [])
     lines = [
         "[critical] Validation failed: teacher lesson_week_count_sum consistency check.",
@@ -342,8 +342,8 @@ def analyze_infeasibility(
     over_capacity_strategy: str = "unassigned",
     subject_spread_strategy: str = "soft",
     ignore_availability: bool = False,
-) -> Dict[str, Any]:
-    report: Dict[str, Any] = {
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
         "global": {},
         "groups": [],
         "top_reasons": [],
@@ -415,7 +415,7 @@ def analyze_infeasibility(
         allow_unassigned = (strategy == "unassigned" and required_lessons > capacity)
 
         g_reasons = []
-        g_detail: Dict[str, Any] = {
+        g_detail: dict[str, Any] = {
             "group_id": gid,
             "max_per_day": max_per_day,
             "days": len(weekday_slots),
@@ -581,7 +581,7 @@ def analyze_infeasibility(
     return report
 
 
-def print_feasibility_report(report: Dict[str, Any]) -> None:
+def print_feasibility_report(report: dict[str, Any]) -> None:
     groups_issues = len(report.get("groups", []))
     teacher_issues = len(report.get("teacher_global_checks", []))
     primary = report.get("primary_cause")
@@ -627,15 +627,15 @@ def print_feasibility_report(report: Dict[str, Any]) -> None:
 
 def build_unsat_core_report(
     solver: cp_model.CpSolver,
-    assumption_records: Dict[int, Dict[str, Any]],
-) -> Dict[str, Any]:
+    assumption_records: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
     core_literals = [int(lit) for lit in solver.sufficient_assumptions_for_infeasibility()]
     category_counts = collections.Counter()
     group_counts = collections.Counter()
     teacher_counts = collections.Counter()
     teacher_time_counts = collections.Counter()
     teacher_group_pair_counts = collections.Counter()
-    core_items: List[Dict[str, Any]] = []
+    core_items: list[dict[str, Any]] = []
 
     for lit in core_literals:
         record = dict(assumption_records.get(lit, {"category": "UNKNOWN"}))
@@ -702,7 +702,7 @@ def build_unsat_core_report(
     }
 
 
-def print_unsat_core_report(report: Dict[str, Any], max_items: int = 20) -> None:
+def print_unsat_core_report(report: dict[str, Any], max_items: int = 20) -> None:
     core_size = int(report.get("core_size", 0))
     if core_size <= 0:
         print("[unsat-core] No assumptions were returned by the solver.", file=sys.stderr)
@@ -778,7 +778,7 @@ def build_model(
     add = model.add
     new_bool_var = model.new_bool_var
     new_int_var = model.new_int_var
-    assumption_records: Optional[Dict[int, Dict[str, Any]]] = {} if diagnose_unsat else None
+    assumption_records: Optional[dict[int, dict[str, Any]]] = {} if diagnose_unsat else None
 
     def add_labeled_constraint(expr, category: Optional[str] = None, **meta: Any):
         ct = add(expr)
@@ -795,11 +795,11 @@ def build_model(
     x = {}  # (group_id, bundle_id, slot_id) -> BoolVar
     occ = {}  # (group_id, slot_id) -> BoolVar
     objective_terms = []
-    assignment_var_meta: Optional[Dict[int, Tuple[int, int, int]]] = (
+    assignment_var_meta: Optional[dict[int, tuple[int, int, int]]] = (
         {} if diagnose_unsat else None
     )
 
-    teacher_time_map: Dict[Tuple[int, int, int], List] = collections.defaultdict(list)
+    teacher_time_map: dict[tuple[int, int, int], list] = collections.defaultdict(list)
     busy_slots = set()
     if data is None:
         raise RuntimeError("No input data loaded. When running inside the service, use solve_to_rows() instead.")
@@ -827,9 +827,9 @@ def build_model(
         }
 
         # Create variables
-        slot_to_xs: Dict[int, List] = {slot.id: [] for slot in slots}
+        slot_to_xs: dict[int, list] = {slot.id: [] for slot in slots}
 
-        subject_to_bundles: Dict[int, List[int]] = collections.defaultdict(list)
+        subject_to_bundles: dict[int, list[int]] = collections.defaultdict(list)
         for bundle in bundles:
             for subject_id in bundle.subject_ids:
                 subject_to_bundles[subject_id].append(bundle.id)
@@ -878,7 +878,7 @@ def build_model(
         spread_hard_active = spread_strategy in {"hard", "both"}
 
         allow_unassigned = strategy == "unassigned" and required_lessons > capacity
-        trimmed_counts: Dict[int, int] = {b.id: b.lesson_count for b in bundles}
+        trimmed_counts: dict[int, int] = {b.id: b.lesson_count for b in bundles}
         trimmed = 0
         if strategy == "trim":
             trimmed_counts, trimmed = _trim_bundle_counts(bundles, capacity)
@@ -1006,7 +1006,7 @@ def build_model(
 
         # Daily load balancing (soft): penalize uneven lessons across days.
         if daily_balance_weight > 0:
-            daily_loads: List[Tuple[Any, int]] = []
+            daily_loads: list[tuple[Any, int]] = []
             for day_index, slot_ids in enumerate(day_slots):
                 if not slot_ids:
                     continue
@@ -1118,7 +1118,7 @@ def resolve_solver_parameter_overrides(
     symmetry_level: Optional[int] = None,
     cp_model_presolve: str = "auto",
     random_seed: Optional[int] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if solver_profile not in SOLVER_PROFILE_CHOICES:
         raise ValueError(
             f"Unknown solver_profile: {solver_profile}. "
@@ -1132,7 +1132,7 @@ def resolve_solver_parameter_overrides(
     if num_search_workers is not None and num_search_workers <= 0:
         raise ValueError("num_search_workers must be > 0")
 
-    profile_defaults: Dict[str, Any] = {"num_search_workers": 8}
+    profile_defaults: dict[str, Any] = {"num_search_workers": 8}
     if solver_profile == "first-feasible":
         profile_defaults = {
             "num_search_workers": 4,
@@ -1140,7 +1140,7 @@ def resolve_solver_parameter_overrides(
             "cp_model_presolve": False,
         }
 
-    resolved: Dict[str, Any] = {}
+    resolved: dict[str, Any] = {}
     resolved["num_search_workers"] = (
         num_search_workers
         if num_search_workers is not None
@@ -1174,7 +1174,7 @@ def configure_solver(
     symmetry_level: Optional[int] = None,
     cp_model_presolve: str = "auto",
     random_seed: Optional[int] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     solver.parameters.max_time_in_seconds = time_limit
     if log:
         solver.parameters.log_search_progress = True
@@ -1193,8 +1193,8 @@ def configure_solver(
 
 def extract_schedule_from_solution(
     solver: cp_model.CpSolver,
-    x: Dict[Tuple[int, int, int], Any],
-    group_info: Dict[int, Dict[str, Any]],
+    x: dict[tuple[int, int, int], Any],
+    group_info: dict[int, dict[str, Any]],
 ) -> dict:
     schedule = {"groups": {}}
     for gid, info in group_info.items():
@@ -1325,7 +1325,7 @@ def solve(
     return schedule, status, solver.ObjectiveValue()
 
 
-def _adapt_infeasibility_report(report: Dict[str, Any]) -> Dict[str, Any]:
+def _adapt_infeasibility_report(report: dict[str, Any]) -> dict[str, Any]:
     """Convert analyze_infeasibility() output to the flat format expected by
     the service router and humanize_infeasible_report()."""
     if not report or not isinstance(report, dict):
@@ -1338,7 +1338,7 @@ def _adapt_infeasibility_report(report: Dict[str, Any]) -> Dict[str, Any]:
     elif isinstance(primary, str):
         primary_str = primary
 
-    reasons: List[Dict[str, Any]] = []
+    reasons: list[dict[str, Any]] = []
 
     for g in (report.get("groups") or []):
         gid = g.get("group_id")
@@ -1391,7 +1391,7 @@ def solve_to_rows(
     subject_spread_strategy: str = "soft",
     subject_spread_weight: int = 5,
     log: bool = False,
-) -> Tuple[Optional[List[dict]], int, Optional[float], Dict[str, Any]]:
+) -> tuple[Optional[list[dict]], int, Optional[float], dict[str, Any]]:
     """Service-compatible entry point.
 
     Accepts ``input_data`` as a parameter (instead of the module-global
@@ -1412,7 +1412,7 @@ def solve_to_rows(
                 m.get("reason", "UNKNOWN")
                 for m in (teacher_val.get("mismatches") or [])
             )
-            meta: Dict[str, Any] = {
+            meta: dict[str, Any] = {
                 "validation_error": teacher_val,
                 "validation_message": msg,
                 "infeasible_report": {
@@ -1471,16 +1471,16 @@ def solve_to_rows(
             return None, status, None, meta
 
         # --- extract flat rows -----------------------------------------
-        rows: List[dict] = []
+        rows: list[dict] = []
         filled_slots = 0
 
         for gid, info in group_info.items():
-            slots: List[Slot] = info["slots"]
-            bundles: List[Bundle] = info["bundles"]
-            day_slots: List[List[int]] = info["day_slots"]
-            c_to_b: Dict[int, int] = info["curriculum_to_bundle"]
+            slots: list[Slot] = info["slots"]
+            bundles: list[Bundle] = info["bundles"]
+            day_slots: list[list[int]] = info["day_slots"]
+            c_to_b: dict[int, int] = info["curriculum_to_bundle"]
 
-            bundle_items: Dict[int, List[dict]] = collections.defaultdict(list)
+            bundle_items: dict[int, list[dict]] = collections.defaultdict(list)
             for cd in (info["group"].get("curriculum_data") or []):
                 cid = cd.get("curriculum_id")
                 if cid is not None and cid in c_to_b:
@@ -1488,7 +1488,7 @@ def solve_to_rows(
 
             bundle_by_id = {b.id: b for b in bundles}
 
-            slot_bundle: Dict[int, Optional[int]] = {}
+            slot_bundle: dict[int, Optional[int]] = {}
             for slot in slots:
                 assigned = None
                 for b in bundles:

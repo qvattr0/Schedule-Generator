@@ -2,7 +2,7 @@ import argparse
 import html
 import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 
 def _fmt_time(value: str) -> str:
@@ -11,19 +11,19 @@ def _fmt_time(value: str) -> str:
     return value
 
 
-def _load_name_maps() -> Tuple[
-    Dict[int, Dict[int, str]],
-    Dict[int, str],
-    Dict[int, str],
-    Dict[int, str],
+def _load_name_maps() -> tuple[
+    dict[int, dict[int, str]],
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
 ]:
     try:
         from mock_data import data as mock_data
     except Exception:
         return {}, {}, {}, {}
 
-    subject_by_group: Dict[int, Dict[int, str]] = {}
-    subject_by_id: Dict[int, str] = {}
+    subject_by_group: dict[int, dict[int, str]] = {}
+    subject_by_id: dict[int, str] = {}
     for item in mock_data.get("curriculum_subjects", []):
         subject_id = item.get("subject_id")
         subject_name = item.get("subject_name")
@@ -36,7 +36,7 @@ def _load_name_maps() -> Tuple[
         subject_by_group.setdefault(int(group_id), {})
         subject_by_group[int(group_id)].setdefault(int(subject_id), subject_name)
 
-    teacher_by_id: Dict[int, str] = {}
+    teacher_by_id: dict[int, str] = {}
     for item in mock_data.get("curriculum_teachers", []):
         teacher_id = item.get("teacher_id")
         teacher_name = item.get("teacher_name")
@@ -44,7 +44,7 @@ def _load_name_maps() -> Tuple[
             continue
         teacher_by_id.setdefault(int(teacher_id), teacher_name)
 
-    group_name_by_id: Dict[int, str] = {}
+    group_name_by_id: dict[int, str] = {}
     for item in mock_data.get("groups_curriculum", []):
         group_id = item.get("group_id")
         group_name = item.get("group_name")
@@ -58,8 +58,8 @@ def _load_name_maps() -> Tuple[
 def _subject_label(
     subject_id: Optional[int],
     group_id: int,
-    subject_by_group: Dict[int, Dict[int, str]],
-    subject_by_id: Dict[int, str],
+    subject_by_group: dict[int, dict[int, str]],
+    subject_by_id: dict[int, str],
 ) -> str:
     if subject_id is None:
         return "Unknown subject"
@@ -68,7 +68,7 @@ def _subject_label(
     return name or "Unknown subject"
 
 
-def _teacher_label(teacher_id: Optional[int], teacher_by_id: Dict[int, str]) -> str:
+def _teacher_label(teacher_id: Optional[int], teacher_by_id: dict[int, str]) -> str:
     if teacher_id is None:
         return "Unknown teacher"
     return teacher_by_id.get(teacher_id) or "Unknown teacher"
@@ -77,9 +77,9 @@ def _teacher_label(teacher_id: Optional[int], teacher_by_id: Dict[int, str]) -> 
 def _build_slot_entries(
     slot: dict,
     group_id: int,
-    subject_by_group: Dict[int, Dict[int, str]],
-    subject_by_id: Dict[int, str],
-    teacher_by_id: Dict[int, str],
+    subject_by_group: dict[int, dict[int, str]],
+    subject_by_id: dict[int, str],
+    teacher_by_id: dict[int, str],
 ) -> list:
     subject_ids = slot.get("subject_ids", [])
     teacher_ids = slot.get("teacher_ids", [])
@@ -117,10 +117,10 @@ def _build_slot_entries(
 
 def _render_group(
     group: dict,
-    subject_by_group: Dict[int, Dict[int, str]],
-    subject_by_id: Dict[int, str],
-    teacher_by_id: Dict[int, str],
-    group_name_by_id: Dict[int, str],
+    subject_by_group: dict[int, dict[int, str]],
+    subject_by_id: dict[int, str],
+    teacher_by_id: dict[int, str],
+    group_name_by_id: dict[int, str],
 ) -> str:
     group_id = int(group["group_id"])
     group_name = str(
@@ -128,13 +128,13 @@ def _render_group(
         or group_name_by_id.get(group_id)
         or f"Group {group_id}"
     )
-    days: Dict[str, dict] = group["days"]
+    days: dict[str, dict] = group["days"]
     day_keys = sorted(days.keys(), key=lambda x: int(x))
     day_names = [days[k]["weekday_name"] for k in day_keys]
 
-    subject_counts_by_day: Dict[str, Dict[int, int]] = {}
+    subject_counts_by_day: dict[str, dict[int, int]] = {}
     for k in day_keys:
-        counts: Dict[int, int] = {}
+        counts: dict[int, int] = {}
         for slot in days[k]["slots"]:
             for subject_id in slot["subject_ids"]:
                 counts[subject_id] = counts.get(subject_id, 0) + 1

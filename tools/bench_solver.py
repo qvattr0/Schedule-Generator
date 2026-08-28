@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, cast
+from typing import Any, Iterable, Optional, Protocol, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,7 +16,7 @@ from ortools.sat.python import cp_model  # noqa: E402
 from render_schedule import render_schedule  # noqa: E402
 
 
-STATUS_NAMES: Dict[cp_model.CpSolverStatus, str] = {
+STATUS_NAMES: dict[cp_model.CpSolverStatus, str] = {
     cp_model.OPTIMAL: "OPTIMAL",
     cp_model.FEASIBLE: "FEASIBLE",
     cp_model.INFEASIBLE: "INFEASIBLE",
@@ -44,10 +44,10 @@ def model_stats_text(model: cp_model.CpModel) -> str:
     return cast(_CpModelWithStats, model).ModelStats()
 
 
-def parse_int_csv(raw: Optional[str]) -> List[int]:
+def parse_int_csv(raw: Optional[str]) -> list[int]:
     if raw is None or not raw.strip():
         return []
-    values: List[int] = []
+    values: list[int] = []
     for part in raw.split(","):
         item = part.strip()
         if not item:
@@ -56,10 +56,10 @@ def parse_int_csv(raw: Optional[str]) -> List[int]:
     return values
 
 
-def parse_symmetry_csv(raw: Optional[str]) -> List[Optional[int]]:
+def parse_symmetry_csv(raw: Optional[str]) -> list[Optional[int]]:
     if raw is None or not raw.strip():
         return []
-    values: List[Optional[int]] = []
+    values: list[Optional[int]] = []
     for part in raw.split(","):
         item = part.strip().lower()
         if not item:
@@ -71,10 +71,10 @@ def parse_symmetry_csv(raw: Optional[str]) -> List[Optional[int]]:
     return values
 
 
-def parse_presolve_csv(raw: Optional[str]) -> List[str]:
+def parse_presolve_csv(raw: Optional[str]) -> list[str]:
     if raw is None or not raw.strip():
         return []
-    values: List[str] = []
+    values: list[str] = []
     for part in raw.split(","):
         item = part.strip().lower()
         if not item:
@@ -95,8 +95,8 @@ def summarize_model_stats(model: cp_model.CpModel, lines: int = 12) -> str:
 
 def solver_stats_dict(
     solver: cp_model.CpSolver, status: cp_model.CpSolverStatus
-) -> Dict[str, Any]:
-    stats: Dict[str, Any] = {
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {
         "status": status_name(status),
         "solver_wall_s": round(float(solver.WallTime()), 3),
         "branches": int(solver.NumBranches()),
@@ -231,7 +231,7 @@ def solve_once(
     cp_model_presolve: str,
     random_seed: Optional[int],
     log: bool = False,
-) -> Tuple[cp_model.CpSolver, cp_model.CpSolverStatus, float, Dict[str, Any]]:
+) -> tuple[cp_model.CpSolver, cp_model.CpSolverStatus, float, dict[str, Any]]:
     solver = cp_model.CpSolver()
     applied = generator.configure_solver(
         solver,
@@ -254,7 +254,7 @@ def main() -> None:
     args = parser.parse_args()
     generator.apply_objective_weight_precedence(args)
 
-    phase_times: Dict[str, float] = {}
+    phase_times: dict[str, float] = {}
 
     validation_report, phase_times["validate_s"] = timed_call(
         generator.validate_teacher_week_count_sum_consistency, generator.data
