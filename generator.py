@@ -4,9 +4,10 @@ import json
 import sys
 import time
 import webbrowser
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 from ortools.sat.python import cp_model
 
 try:
