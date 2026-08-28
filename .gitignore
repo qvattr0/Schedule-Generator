@@ -1,9 +1,13 @@
 .venv
 __pycache__
 
+tmp_data.json
+
 # project-specific output files
 schedule.html
 schedule.json
 
 mock_data.py
 generator_v1/
+
+graphify-out/*
