@@ -51,6 +51,10 @@ class DataValidationError(RuntimeError):
     pass
 
 
+class InputDataLoadError(RuntimeError):
+    pass
+
+
 class ObjectiveWeightConfigError(RuntimeError):
     pass
 
@@ -65,6 +69,39 @@ OBJECTIVE_WEIGHT_DEFAULTS: dict[str, int] = {
 OBJECTIVE_WEIGHTS_CONFIG_PATH = Path(__file__).with_name("objective_weights.toml")
 SOLVER_PROFILE_CHOICES = ("default", "first-feasible")
 CP_MODEL_PRESOLVE_CHOICES = ("auto", "on", "off")
+
+
+def load_input_data(input_path: Path) -> dict:
+    """Load and lightly validate a generator input payload from a JSON file."""
+    try:
+        payload_text = input_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise InputDataLoadError(f"Failed to read input data {input_path}: {exc}") from exc
+
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise InputDataLoadError(
+            f"Failed to parse input data {input_path}: {exc.msg} "
+            f"(line {exc.lineno}, column {exc.colno})."
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise InputDataLoadError(
+            f"Input data {input_path} must be a JSON object, got {type(payload).__name__}."
+        )
+
+    required_list_keys = ("groups_curriculum", "teachers_busy")
+    invalid_keys = [
+        key for key in required_list_keys if not isinstance(payload.get(key), list)
+    ]
+    if invalid_keys:
+        raise InputDataLoadError(
+            f"Input data {input_path} must contain list value(s) for: "
+            f"{', '.join(invalid_keys)}."
+        )
+
+    return payload
 
 
 def load_objective_weight_config(config_path: Path = OBJECTIVE_WEIGHTS_CONFIG_PATH) -> dict[str, int]:
@@ -1553,7 +1590,19 @@ def solve_to_rows(
 
 
 def main():
+    global data
+
     parser = argparse.ArgumentParser(description="Generate timetable with OR-Tools CP-SAT")
+    parser.add_argument(
+        "--input-data",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Read generator input from a JSON file instead of mock_data.py "
+            "(for example: --input-data tmp_data.json)."
+        ),
+    )
     parser.add_argument("--time-limit", type=int, default=60, help="Max solve time in seconds")
     parser.add_argument(
         "--solver-profile",
@@ -1690,6 +1739,9 @@ def main():
     parser.add_argument("--log", action="store_true", help="Enable solver log output")
     args = parser.parse_args()
     try:
+        if args.input_data is not None:
+            data = load_input_data(args.input_data)
+            print(f"Loaded input data from {args.input_data}", file=sys.stderr)
         apply_objective_weight_precedence(args)
         schedule, status, objective = solve(
             time_limit=args.time_limit,
@@ -1711,6 +1763,9 @@ def main():
             random_seed=args.random_seed,
         )
     except DataValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    except InputDataLoadError as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)
     except ObjectiveWeightConfigError as exc:
