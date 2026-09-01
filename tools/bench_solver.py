@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 
 import generator  # noqa: E402
 from ortools.sat.python import cp_model  # noqa: E402
-from render_schedule import render_schedule  # noqa: E402
+from render_schedule import attach_input_source, render_schedule  # noqa: E402
 
 
 STATUS_NAMES: dict[cp_model.CpSolverStatus, str] = {
@@ -321,6 +321,8 @@ def main() -> None:
         print("[post-solve]")
         print(f"extract_schedule_s: {extract_s:.3f}s")
 
+        attach_input_source(schedule)
+
         if args.output:
             output_path = Path(args.output)
             started = time.perf_counter()
@@ -331,7 +333,11 @@ def main() -> None:
 
         if args.render:
             started = time.perf_counter()
-            html = render_schedule(schedule, group_id=args.render_group)
+            html = render_schedule(
+                schedule,
+                group_id=args.render_group,
+                input_data=generator.data,
+            )
             render_cpu_s = time.perf_counter() - started
             render_path = Path(args.render)
             started = time.perf_counter()

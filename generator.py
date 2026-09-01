@@ -16,8 +16,9 @@ except ImportError:
     data = None
 
 try:
-    from render_schedule import render_schedule
+    from render_schedule import attach_input_source, render_schedule
 except ImportError:
+    attach_input_source = None
     render_schedule = None
 
 try:
@@ -1776,6 +1777,9 @@ def main():
         print(f"No feasible solution found. Status: {status}", file=sys.stderr)
         sys.exit(2)
 
+    if attach_input_source is not None:
+        attach_input_source(schedule, args.input_data)
+
     with open(args.output, "w") as f:
         json.dump(schedule, f, indent=2)
 
@@ -1786,7 +1790,12 @@ def main():
         if render_schedule is None:
             print("render_schedule is not available (missing render_schedule module).", file=sys.stderr)
             sys.exit(2)
-        html = render_schedule(schedule, group_id=args.render_group)
+        html = render_schedule(
+            schedule,
+            group_id=args.render_group,
+            input_data=data,
+            schedule_path=Path(args.output),
+        )
         with open(args.render, "w") as f:
             f.write(html)
         print(f"Wrote timetable HTML to {args.render}")

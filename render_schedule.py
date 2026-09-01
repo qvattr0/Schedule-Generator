@@ -1,8 +1,16 @@
 import argparse
 import html
 import json
+import sys
 from pathlib import Path
 from typing import Optional
+
+NameMaps = tuple[
+    dict[int, dict[int, str]],
+    dict[int, str],
+    dict[int, str],
+    dict[int, str],
+]
 
 
 def _fmt_time(value: str) -> str:
@@ -11,20 +19,26 @@ def _fmt_time(value: str) -> str:
     return value
 
 
-def _load_name_maps() -> tuple[
-    dict[int, dict[int, str]],
-    dict[int, str],
-    dict[int, str],
-    dict[int, str],
-]:
-    try:
-        from mock_data import data as mock_data
-    except Exception:
-        return {}, {}, {}, {}
+def _empty_name_maps() -> NameMaps:
+    return {}, {}, {}, {}
 
+
+def attach_input_source(schedule: dict, input_data_path: Optional[Path] = None) -> dict:
+    """Record which generator input produced this schedule so later renders can load names."""
+    if input_data_path is None:
+        schedule["source"] = {"kind": "mock_data"}
+    else:
+        schedule["source"] = {
+            "kind": "json",
+            "input_data": str(input_data_path),
+        }
+    return schedule
+
+
+def _name_maps_from_payload(payload: dict) -> NameMaps:
     subject_by_group: dict[int, dict[int, str]] = {}
     subject_by_id: dict[int, str] = {}
-    for item in mock_data.get("curriculum_subjects", []):
+    for item in payload.get("curriculum_subjects", []):
         subject_id = item.get("subject_id")
         subject_name = item.get("subject_name")
         if subject_id is None or not subject_name:
@@ -37,7 +51,7 @@ def _load_name_maps() -> tuple[
         subject_by_group[int(group_id)].setdefault(int(subject_id), subject_name)
 
     teacher_by_id: dict[int, str] = {}
-    for item in mock_data.get("curriculum_teachers", []):
+    for item in payload.get("curriculum_teachers", []):
         teacher_id = item.get("teacher_id")
         teacher_name = item.get("teacher_name")
         if teacher_id is None or not teacher_name:
@@ -45,7 +59,7 @@ def _load_name_maps() -> tuple[
         teacher_by_id.setdefault(int(teacher_id), teacher_name)
 
     group_name_by_id: dict[int, str] = {}
-    for item in mock_data.get("groups_curriculum", []):
+    for item in payload.get("groups_curriculum", []):
         group_id = item.get("group_id")
         group_name = item.get("group_name")
         if group_id is None or not group_name:
@@ -53,6 +67,91 @@ def _load_name_maps() -> tuple[
         group_name_by_id.setdefault(int(group_id), str(group_name))
 
     return subject_by_group, subject_by_id, teacher_by_id, group_name_by_id
+
+
+def _load_mock_data_payload() -> Optional[dict]:
+    try:
+        from mock_data import data as mock_data
+    except Exception:
+        return None
+    if isinstance(mock_data, dict):
+        return mock_data
+    return None
+
+
+def _resolve_input_data_path(raw: str, schedule_path: Optional[Path] = None) -> Path:
+    path = Path(raw)
+    candidates = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        if schedule_path is not None:
+            candidates.append(schedule_path.parent / path)
+        candidates.append(Path.cwd() / path)
+        candidates.append(path)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _load_json_payload(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"Failed to read input data {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Failed to parse input data {path}: {exc.msg} "
+            f"(line {exc.lineno}, column {exc.colno})."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(
+            f"Input data {path} must be a JSON object, got {type(payload).__name__}."
+        )
+    return payload
+
+
+def _payload_from_schedule_source(
+    schedule: dict,
+    schedule_path: Optional[Path] = None,
+) -> Optional[dict]:
+    source = schedule.get("source")
+    if not isinstance(source, dict):
+        return None
+    kind = source.get("kind")
+    if kind == "mock_data":
+        return _load_mock_data_payload()
+    raw_path = source.get("input_data")
+    if not raw_path:
+        return None
+    path = _resolve_input_data_path(str(raw_path), schedule_path)
+    if not path.is_file():
+        print(
+            f"Warning: schedule source input_data not found at {path}; "
+            "falling back to mock_data.py",
+            file=sys.stderr,
+        )
+        return None
+    return _load_json_payload(path)
+
+
+def _load_name_maps(
+    *,
+    payload: Optional[dict] = None,
+    input_data_path: Optional[Path] = None,
+    schedule: Optional[dict] = None,
+    schedule_path: Optional[Path] = None,
+) -> NameMaps:
+    if payload is None and input_data_path is not None:
+        payload = _load_json_payload(input_data_path)
+    if payload is None and schedule is not None:
+        payload = _payload_from_schedule_source(schedule, schedule_path)
+    if payload is None:
+        payload = _load_mock_data_payload()
+    if payload is None:
+        return _empty_name_maps()
+    return _name_maps_from_payload(payload)
 
 
 def _subject_label(
@@ -230,8 +329,20 @@ def _render_group(
     return f"<section><h2 class=\"group-title\">{title}</h2>{table}</section>"
 
 
-def render_schedule(schedule: dict, group_id: Optional[int] = None) -> str:
-    subject_by_group, subject_by_id, teacher_by_id, group_name_by_id = _load_name_maps()
+def render_schedule(
+    schedule: dict,
+    group_id: Optional[int] = None,
+    *,
+    input_data: Optional[dict] = None,
+    input_data_path: Optional[Path] = None,
+    schedule_path: Optional[Path] = None,
+) -> str:
+    subject_by_group, subject_by_id, teacher_by_id, group_name_by_id = _load_name_maps(
+        payload=input_data,
+        input_data_path=input_data_path,
+        schedule=schedule,
+        schedule_path=schedule_path,
+    )
     groups = schedule.get("groups", {})
     if group_id is not None:
         key = str(group_id)
@@ -414,11 +525,27 @@ def main() -> None:
     parser.add_argument("--input", default="schedule.json", help="Input JSON schedule file")
     parser.add_argument("--output", default="schedule.html", help="Output HTML file")
     parser.add_argument("--group", type=int, default=None, help="Render a single group_id")
+    parser.add_argument(
+        "--input-data",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Generator input JSON used to resolve subject/teacher names. "
+            "Overrides schedule['source'] when both are present."
+        ),
+    )
     args = parser.parse_args()
 
-    data = json.loads(Path(args.input).read_text())
-    html = render_schedule(data, group_id=args.group)
-    Path(args.output).write_text(html)
+    schedule_path = Path(args.input)
+    data = json.loads(schedule_path.read_text(encoding="utf-8"))
+    html = render_schedule(
+        data,
+        group_id=args.group,
+        input_data_path=args.input_data,
+        schedule_path=schedule_path,
+    )
+    Path(args.output).write_text(html, encoding="utf-8")
     print(f"Wrote {args.output}")
 
 
