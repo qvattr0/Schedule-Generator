@@ -11,3 +11,6 @@ mock_data.py
 generator_v1/
 
 graphify-out/*
+
+# macOS files
+.DS_Store
